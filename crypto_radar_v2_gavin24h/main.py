@@ -1,5 +1,5 @@
 """
-Crypto Radar V2 (V2.8)
+Crypto Radar V2 (V2.9)
 严格双流隔离, fallback仅从合法观察池选, 多因子fallback排序
 """
 from __future__ import annotations
@@ -174,8 +174,11 @@ class CryptoRadar:
             if ok: pushed_cands.append(sig)
             else: main_overflow.append(sig)
 
-        # 主推溢出合并到观察池 (已过合法性)
-        combined_wl = valid_wl + main_overflow
+        # 10. Cross-exchange dedup (V2.9) — 同币多交易所只保留最优
+        xd_kept, xd_demoted = self.filter.cross_exchange_dedup(pushed_cands)
+
+        # 主推溢出 + 跨交易所降级 合并到观察池 (已过合法性)
+        combined_wl = valid_wl + main_overflow + xd_demoted
         # 去重 + 冷却检查
         seen = set()
         final_wl: list[Signal] = []
@@ -188,18 +191,65 @@ class CryptoRadar:
 
         logger.info(f"Post: main={rs.post_filter_passed} wl={len(final_wl)}")
 
-        # 10. Dedup (主推)
-        deduped = self.filter.cluster_dedup(pushed_cands)
-        logger.info(f"Dedup: {rs.cluster_dedup_passed}")
+        # 11. Cluster dedup (叙事去重)
+        deduped = self.filter.cluster_dedup(xd_kept)
+        logger.info(f"Dedup: {rs.cluster_dedup_passed} (xd_demoted={len(xd_demoted)})")
 
         final_wl.sort(key=lambda sig: sig.score.total_score, reverse=True)
         final_wl = final_wl[:s.max_daily_watchlist]
 
         # ============================================================
-        # 11. PUSH 主推
+        # 12. PRE-PUSH PRICE RECHECK (V2.9) — 推送前实时价格复核
+        # ============================================================
+        recheck_passed: list[Signal] = []
+        recheck_demoted: list[Signal] = []
+        if s.recheck_enabled and deduped:
+            rc_sem = asyncio.Semaphore(5)
+            async def _recheck(sig: Signal) -> Signal:
+                async with rc_sem:
+                    src = self._resolve(sig.market_data)
+                    if not src:
+                        return sig
+                    try:
+                        klines = await src.fetch_klines(sig.symbol, "1m", 1)
+                        if klines:
+                            import time as _t
+                            rc_price = klines[-1].get("close", 0)
+                            if rc_price > 0:
+                                dev = abs(rc_price - sig.price) / sig.price * 100
+                                sig.market_data.validation.recheck_price = rc_price
+                                sig.market_data.validation.recheck_deviation_pct = round(dev, 2)
+                                sig.market_data.validation.recheck_time = _t.time()
+                    except Exception as e:
+                        logger.warning(f"Recheck failed {sig.symbol}: {e}")
+                    return sig
+
+            rechecked = await asyncio.gather(*(_recheck(sig) for sig in deduped), return_exceptions=True)
+            for r in rechecked:
+                if isinstance(r, Exception):
+                    continue
+                sig = r
+                dev = sig.market_data.validation.recheck_deviation_pct
+                if dev > s.recheck_max_deviation_pct and sig.market_data.validation.recheck_price > 0:
+                    logger.info(f"Recheck DEMOTE {sig.symbol}: dev={dev:.1f}% > {s.recheck_max_deviation_pct}%")
+                    recheck_demoted.append(sig)
+                else:
+                    recheck_passed.append(sig)
+        else:
+            recheck_passed = deduped
+
+        # 复核降级的进观察池
+        for sig in recheck_demoted:
+            if self.filter.is_watchlist_candidate(sig):
+                final_wl.append(sig)
+
+        logger.info(f"Recheck: passed={len(recheck_passed)} demoted={len(recheck_demoted)}")
+
+        # ============================================================
+        # 13. PUSH 主推
         # ============================================================
         n_push = 0
-        for sig in deduped:
+        for sig in recheck_passed:
             self.db.save_signal(sig)
             try:
                 await self.notifier.push_signal(sig)
@@ -208,7 +258,7 @@ class CryptoRadar:
             except Exception as e: logger.error(f"Push err {sig.symbol}: {e}")
 
         # ============================================================
-        # 12. PUSH 观察池 (正常)
+        # 14. PUSH 观察池 (正常)
         # ============================================================
         n_wl = 0
         if final_wl:
@@ -218,12 +268,12 @@ class CryptoRadar:
             except Exception as e: logger.error(f"WL err: {e}")
 
         # ============================================================
-        # 13. FALLBACK — 严格只从 valid_wl 选 (不混入 valid_main)
+        # 15. FALLBACK — 严格只从 valid_wl 选 (不混入 valid_main)
         # ============================================================
         if n_push == 0 and n_wl == 0 and s.push_watchlist_on_empty_main:
             # 只用观察池流中已过合法性的信号 (valid_wl, 不含 main_overflow)
             fb_pool = [sig for sig in valid_wl
-                       if sig.phase != SignalPhase.REJECT and sig.score.total_score > 15]
+                       if sig.phase != SignalPhase.REJECT and sig.score.total_score > 25]
             # 多因子排序
             fb_ranked = self.filter.rank_for_fallback(fb_pool)
             # 去重
@@ -260,10 +310,10 @@ class CryptoRadar:
 
     async def run_loop(self):
         s = self.settings
-        logger.info(f"🚀 V2.8 | {s.scoring_mode}")
+        logger.info(f"🚀 V2.9 | {s.scoring_mode}")
         await self.load_caches()
         await self.notifier.push_text(
-            f"🚀 <b>Crypto Radar V2.8</b>\n"
+            f"🚀 <b>Crypto Radar V2.9</b>\n"
             f"模式:{s.scoring_mode} 间隔:{s.scan_interval_seconds}s\n"
             f"源:{','.join(src.name for src in self.sources)}\n"
             f"价格校验:{'开' if s.enable_price_verification else '关'} "

@@ -1,10 +1,11 @@
 """
-Crypto Radar V2 - Telegram (V2.8)
+Crypto Radar V2 - Telegram (V2.9)
 三层推送视觉明确区分: 主推🎯 / 观察👁 / 保底⏳
+V2.9: 结构化AI二筛摘要 + 复核价偏差 + 执行级别
 """
 from __future__ import annotations
 import logging, aiohttp
-from models import Signal, SignalPhase, ChaseRiskLevel, MarketStatus, SignalSourceType
+from models import Signal, SignalPhase, ChaseRiskLevel, MarketStatus, SignalSourceType, ExecutionLevel
 from config.settings import Settings
 
 logger = logging.getLogger("radar.telegram")
@@ -13,12 +14,27 @@ PE = {SignalPhase.STARTUP:"🟢",SignalPhase.ACCELERATION:"🔵",SignalPhase.OVE
 CE = {ChaseRiskLevel.LOW:"🟢",ChaseRiskLevel.MEDIUM:"🟡",ChaseRiskLevel.HIGH:"🔴"}
 SE = {MarketStatus.ACTIVE:"✅",MarketStatus.INACTIVE:"⛔",MarketStatus.DELISTED:"🚫",MarketStatus.UNKNOWN:"❓"}
 
+# 执行级别 emoji
+ELE = {
+    ExecutionLevel.MAIN_SIGNAL.value: "✅",
+    ExecutionLevel.LIMIT_ONLY.value: "📌",
+    ExecutionLevel.WATCH.value: "👀",
+    ExecutionLevel.AI_REVIEW_ONLY.value: "🤖",
+    ExecutionLevel.REJECT.value: "❌",
+}
+
 def _fn(n):
     if n<=0: return "N/A"
     if n>=1e9: return f"{n/1e9:.2f}B"
     if n>=1e6: return f"{n/1e6:.2f}M"
     if n>=1e3: return f"{n/1e3:.1f}K"
     return f"{n:.0f}"
+
+def _el_cn(val: str) -> str:
+    try:
+        return ExecutionLevel(val).cn
+    except ValueError:
+        return val
 
 
 class TelegramNotifier:
@@ -53,12 +69,17 @@ class TelegramNotifier:
     def _main_card(self, sig: Signal) -> str:
         p=sig.market_data.periods; a=sig.advice; sc=sig.score; ch=sig.chase_risk; v=sig.market_data.validation
         pe=PE.get(sig.phase,"⚪"); ce=CE.get(ch.chase_risk_level,"⚪"); se=SE.get(v.market_status,"❓")
+        el_e = ELE.get(a.execution_level, "❓")
         L = []
         L.append(f"🎯 <b>【主推·{sig.phase.cn}】{sig.symbol}</b>")
+        L.append(f"{el_e} <b>执行级别: {_el_cn(a.execution_level)}</b>")
         L.append("━━━━━━━━━━━━━━━━━━")
         L.append(f"🏷 {v.signal_source_type.value} | {se}{v.market_status.value}")
         L.append(f"🔍 标的:{'✅' if v.symbol_validated else '❌'} 价格:{'✅' if v.price_verified else '❌'}")
         if v.price_deviation_pct>0: L.append(f"  偏差:{v.price_deviation_pct:.2f}%")
+        # V2.9: 复核价信息
+        if v.recheck_price > 0:
+            L.append(f"🔄 复核价: ${v.recheck_price:.6g} (偏差{v.recheck_deviation_pct:+.2f}%)")
         if v.source_validation_reason: L.append(f"  ⚠️ {v.source_validation_reason}")
         L.append("━━━━━━━━━━━━━━━━━━")
         L.append(f"📍 {sig.source}")
@@ -109,55 +130,104 @@ class TelegramNotifier:
         for sig in sigs[:12]:
             p=sig.market_data.periods; v=sig.market_data.validation; ch=sig.chase_risk
             pe=PE.get(sig.phase,"⚪"); ce=CE.get(ch.chase_risk_level,"⚪")
+            el_e = ELE.get(sig.advice.execution_level, "❓")
             L.append(f"{pe} <b>{sig.symbol}</b> [{sig.source}] ({v.signal_source_type.value})")
-            L.append(f"  ${sig.price:.6g} | 5m {p.change_5m:+.1f}% 15m {p.change_15m:+.1f}% 1h {p.change_1h:+.1f}% 4h {p.change_4h:+.1f}%")
+            L.append(f"  {el_e}{_el_cn(sig.advice.execution_level)} | ${sig.price:.6g}")
+            L.append(f"  5m {p.change_5m:+.1f}% 15m {p.change_15m:+.1f}% 1h {p.change_1h:+.1f}% 4h {p.change_4h:+.1f}% 24h {p.change_24h:+.1f}%")
             L.append(f"  vr5m {p.volume_ratio_5m:.1f}x | 分{sig.score.total_score:.0f}[{sig.score.grade.value}] | "
                      f"{ce}{ch.chase_risk_level.cn} | {sig.phase.cn} | 24h${_fn(p.turnover_24h)}")
-            L.append(f"  验证:sym={'✅' if v.symbol_validated else '❌'} px={'✅' if v.price_verified else '❌'} mkt={v.market_status.value}")
             if sig.trigger_reasons: L.append(f"  触发:{'; '.join(sig.trigger_reasons[:3])}")
             if sig.risk_warnings: L.append(f"  风险:{'; '.join(sig.risk_warnings[:2])}")
             if sig.market_data.trade_url: L.append(f"  🔗 {sig.market_data.trade_url}")
             L.append("")
 
+        # 结构化AI二筛摘要
         L.append("━━━━━━━━━━━━━━━━━━\n<pre>")
-        tag = "保底观察·AI二筛" if is_fallback else "观察池·AI二筛"
-        L.append(f"【{tag}摘要】\n⚠️ 不可直接执行")
+        tag = "保底观察" if is_fallback else "观察池"
+        L.append(f"【{tag}·AI二筛摘要】")
+        L.append("⚠️ execution_level=ai_review_only 不可直接执行")
         for sig in sigs[:12]:
             p=sig.market_data.periods; v=sig.market_data.validation
-            L.append(f"{sig.symbol}|{sig.source}|{v.signal_source_type.value}|${sig.price:.6g}|"
-                     f"5m:{p.change_5m:+.1f}% 15m:{p.change_15m:+.1f}% 1h:{p.change_1h:+.1f}% 4h:{p.change_4h:+.1f}% 24h:{p.change_24h:+.1f}%|"
-                     f"vr5m:{p.volume_ratio_5m:.1f}x|分:{sig.score.total_score:.0f}{sig.score.grade.value}|"
-                     f"{sig.phase.cn}|追高:{sig.chase_risk.chase_risk_level.cn}|"
-                     f"sym:{'Y' if v.symbol_validated else 'N'} px:{'Y' if v.price_verified else 'N'}")
+            L.append(self._summary_line(sig))
         L.append("</pre>")
         return "\n".join(L)
 
-    # =================== 二筛摘要 ===================
+    # =================== 二筛摘要 (结构化 key:value, V2.9) ===================
     def _summary(self, sig: Signal) -> str:
+        """主推信号的结构化摘要 — 方便复制给 ChatGPT/Grok/OpenClaw 做二筛"""
         p=sig.market_data.periods; a=sig.advice; sc=sig.score; v=sig.market_data.validation; ch=sig.chase_risk
         lq = f"${_fn(sig.market_data.chain_data.liquidity_usd)}" if sig.market_data.chain_data else f"CEX(${_fn(p.turnover_24h)})"
-        L = ["【二筛摘要】",
-            f"交易所:{sig.source}", f"交易对:{sig.symbol}", f"类型:{v.signal_source_type.value}",
-            f"市场:{v.market_status.value}", f"标的验证:{'通过' if v.symbol_validated else '未通过'}",
-            f"价格验证:{'通过' if v.price_verified else '未通过'}", f"原始ID:{v.market_id_raw}",
-            f"价格偏差:{v.price_deviation_pct:.2f}%", f"价格:${sig.price:.6g}",
-            f"1m:{p.change_1m:+.2f}%", f"5m:{p.change_5m:+.2f}%", f"15m:{p.change_15m:+.2f}%",
-            f"1h:{p.change_1h:+.2f}%", f"4h:{p.change_4h:+.2f}%", f"24h:{p.change_24h:+.2f}%",
-            f"5m量比:{p.volume_ratio_5m:.2f}x", f"15m量比:{p.volume_ratio_15m:.2f}x", f"1h量比:{p.volume_ratio_1h:.2f}x",
-            f"24h成交额:${_fn(p.turnover_24h)}", f"1h成交额:${_fn(p.turnover_1h)}",
-            f"流动性:{lq}", f"市值:${_fn(sig.market_data.market_cap)}", f"波动率:{sig.market_data.volatility_24h:.1f}%",
-            f"阶段:{sig.phase.cn}", f"评分:{sc.total_score:.0f}/100({sc.grade.value})",
-            f"执行优先级:{a.execution_priority_score:.0f}", f"建议:{a.suggested_action}",
-            f"追高:{ch.chase_risk_level.cn}", f"24h短线:{'是' if a.is_suitable_for_24h_trade else '否'}",
-            f"持有窗口:{a.recommended_holding_window.value}", f"仓位:{a.suggested_position_size.value}",
-            f"触发:{'; '.join(sig.trigger_reasons[:5])}", f"风险:{'; '.join(sig.risk_warnings[:4])}",
-            f"否决:{a.rejection_reason or '无'}",
-            f"失效:{a.invalidation_hint}", f"止盈:{a.take_profit_hint}", f"止损:{a.stop_loss_hint}"]
+        L = [
+            "【AI二筛数据·请直接复制给AI分析】",
+            f"symbol: {sig.symbol}",
+            f"exchange: {sig.source}",
+            f"source_type: {v.signal_source_type.value}",
+            f"market_status: {v.market_status.value}",
+            f"symbol_verified: {'Y' if v.symbol_validated else 'N'}",
+            f"price_verified: {'Y' if v.price_verified else 'N'}",
+            f"raw_id: {v.market_id_raw}",
+            f"price_at_scan: ${sig.price:.6g}",
+            f"price_deviation_pct: {v.price_deviation_pct:.2f}%",
+        ]
+        # V2.9: 复核价
+        if v.recheck_price > 0:
+            L.append(f"recheck_price: ${v.recheck_price:.6g}")
+            L.append(f"recheck_deviation_pct: {v.recheck_deviation_pct:.2f}%")
+        L.extend([
+            f"change_1m: {p.change_1m:+.2f}%",
+            f"change_5m: {p.change_5m:+.2f}%",
+            f"change_15m: {p.change_15m:+.2f}%",
+            f"change_1h: {p.change_1h:+.2f}%",
+            f"change_4h: {p.change_4h:+.2f}%",
+            f"change_24h: {p.change_24h:+.2f}%",
+            f"vol_ratio_5m: {p.volume_ratio_5m:.2f}x",
+            f"vol_ratio_15m: {p.volume_ratio_15m:.2f}x",
+            f"vol_ratio_1h: {p.volume_ratio_1h:.2f}x",
+            f"turnover_24h: ${_fn(p.turnover_24h)}",
+            f"turnover_1h: ${_fn(p.turnover_1h)}",
+            f"liquidity: {lq}",
+            f"market_cap: ${_fn(sig.market_data.market_cap)}",
+            f"volatility_24h: {sig.market_data.volatility_24h:.1f}%",
+            f"phase: {sig.phase.value}",
+            f"score: {sc.total_score:.0f}/100",
+            f"grade: {sc.grade.value}",
+            f"score_detail: mom={sc.momentum_score:.0f} vol={sc.volume_quality_score:.0f} liq={sc.liquidity_score:.0f} cont={sc.continuation_score:.0f} brk={sc.breakout_quality_score:.0f} exe={sc.execution_score:.0f}",
+            f"penalties: heat=-{sc.overheat_penalty:.0f} manip=-{sc.manipulation_risk_penalty:.0f} chain=-{sc.chain_risk_penalty:.0f}",
+            f"execution_level: {a.execution_level}",
+            f"action: {a.suggested_action}",
+            f"chase_risk: {ch.chase_risk_level.value}",
+            f"suitable_24h: {'Y' if a.is_suitable_for_24h_trade else 'N'}",
+            f"holding_window: {a.recommended_holding_window.value}",
+            f"position_size: {a.suggested_position_size.value}",
+            f"triggers: {'; '.join(sig.trigger_reasons[:5])}",
+            f"risks: {'; '.join(sig.risk_warnings[:4])}",
+            f"rejection: {a.rejection_reason or 'none'}",
+            f"invalidation: {a.invalidation_hint}",
+            f"take_profit: {a.take_profit_hint}",
+            f"stop_loss: {a.stop_loss_hint}",
+        ])
         if sig.market_data.chain_data:
             cd=sig.market_data.chain_data
-            L.append(f"链:{cd.chain} 池龄:{cd.pool_age_hours:.0f}h 买卖比:{cd.buys_vs_sells_ratio:.2f}")
-        if sig.market_data.trade_url: L.append(f"链接:{sig.market_data.trade_url}")
+            L.append(f"chain: {cd.chain}")
+            L.append(f"pool_age_hours: {cd.pool_age_hours:.0f}")
+            L.append(f"buy_sell_ratio: {cd.buys_vs_sells_ratio:.2f}")
+        if sig.market_data.trade_url: L.append(f"trade_url: {sig.market_data.trade_url}")
         return "\n".join(L)
+
+    def _summary_line(self, sig: Signal) -> str:
+        """观察池单行结构化摘要"""
+        p=sig.market_data.periods; v=sig.market_data.validation; a=sig.advice
+        return (
+            f"{sig.symbol}|{sig.source}|{v.signal_source_type.value}|"
+            f"${sig.price:.6g}|"
+            f"5m:{p.change_5m:+.1f}% 1h:{p.change_1h:+.1f}% 4h:{p.change_4h:+.1f}% 24h:{p.change_24h:+.1f}%|"
+            f"vr5m:{p.volume_ratio_5m:.1f}x|"
+            f"score:{sig.score.total_score:.0f}{sig.score.grade.value}|"
+            f"phase:{sig.phase.value}|"
+            f"exec:{a.execution_level}|"
+            f"chase:{sig.chase_risk.chase_risk_level.value}|"
+            f"24h_ok:{'Y' if a.is_suitable_for_24h_trade else 'N'}"
+        )
 
     # =================== 发送 ===================
     async def _send(self, text: str):

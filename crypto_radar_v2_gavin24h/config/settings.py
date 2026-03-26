@@ -113,6 +113,19 @@ class Settings:
     leverage_allowlist: list[str] = field(default_factory=list)
     watchlist_reject_if_24h_overheat: float = 28.0
 
+    # V2.9: 推送前复核
+    recheck_enabled: bool = True
+    recheck_max_deviation_pct: float = 3.0   # 复核偏差超此值→降级观察池
+
+    # V2.9: 跨交易所去重
+    cross_exchange_dedup_enabled: bool = True
+
+    # V2.9: 加强脉冲/假突破过滤
+    pulse_5m_change_threshold: float = 5.0   # 5m涨>此值且1h<2%→纯脉冲拒绝
+    pulse_5m_1h_max: float = 2.0
+    fake_breakout_5m_min: float = 3.0        # 5m涨>此值且4h<0→假突破降级
+    tail_surge_24h_min: float = 10.0         # 24h>此值且(24h-4h)<3%→尾段惩罚
+
 
 def load_settings() -> Settings:
     s = Settings()
@@ -176,4 +189,12 @@ def load_settings() -> Settings:
     s.leverage_watchlist_only = _eb("LEVERAGE_WATCHLIST_ONLY",True)
     s.leverage_allowlist = [x.upper() for x in _el("LEVERAGE_ALLOWLIST")]
     s.watchlist_reject_if_24h_overheat = _ef("WATCHLIST_REJECT_IF_24H_OVERHEAT",28.0)
+    # V2.9
+    s.recheck_enabled = _eb("RECHECK_ENABLED", True)
+    s.recheck_max_deviation_pct = _ef("RECHECK_MAX_DEVIATION_PCT", 3.0)
+    s.cross_exchange_dedup_enabled = _eb("CROSS_EXCHANGE_DEDUP_ENABLED", True)
+    s.pulse_5m_change_threshold = _ef("PULSE_5M_CHANGE_THRESHOLD", 5.0)
+    s.pulse_5m_1h_max = _ef("PULSE_5M_1H_MAX", 2.0)
+    s.fake_breakout_5m_min = _ef("FAKE_BREAKOUT_5M_MIN", 3.0)
+    s.tail_surge_24h_min = _ef("TAIL_SURGE_24H_MIN", 10.0)
     return s

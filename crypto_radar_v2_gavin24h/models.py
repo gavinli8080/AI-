@@ -24,6 +24,35 @@ class SignalPhase(str, Enum):
         }[self.value]
 
 
+class ExecutionLevel(str, Enum):
+    """推送执行级别 — 用于Telegram推送和AI二筛"""
+    MAIN_SIGNAL = "main_signal"
+    LIMIT_ONLY = "limit_only"
+    WATCH = "watch"
+    AI_REVIEW_ONLY = "ai_review_only"
+    REJECT = "reject"
+
+    @property
+    def cn(self) -> str:
+        return {
+            "main_signal": "主信号",
+            "limit_only": "仅挂单",
+            "watch": "观察",
+            "ai_review_only": "仅AI二筛",
+            "reject": "放弃",
+        }[self.value]
+
+    @property
+    def action_hint(self) -> str:
+        return {
+            "main_signal": "可轻仓试错",
+            "limit_only": "建议挂单,不追现价",
+            "watch": "仅观察,等结构确认",
+            "ai_review_only": "不可执行,仅供AI二筛参考",
+            "reject": "放弃,不操作",
+        }[self.value]
+
+
 class ChaseRiskLevel(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
@@ -169,6 +198,7 @@ class TradingAdvice:
     execution_priority_score: float = 0.0
     rejection_reason: str = ""
     suggested_action: str = "放弃"
+    execution_level: str = "reject"  # ExecutionLevel.value
     not_recommended_if_chasing: bool = True
     invalidation_hint: str = ""
     take_profit_hint: str = ""
@@ -188,6 +218,10 @@ class MarketValidation:
     source_validation_reason: str = "" # 校验失败原因
     kline_close_price: float = 0.0     # K线验证价格
     price_deviation_pct: float = 0.0   # ticker vs kline 偏差百分比
+    # V2.9: 推送前实时复核
+    recheck_price: float = 0.0         # 推送前复核价
+    recheck_deviation_pct: float = 0.0 # 复核价 vs 评分价偏差%
+    recheck_time: float = 0.0          # 复核时间戳
 
 
 @dataclass

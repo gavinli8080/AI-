@@ -361,6 +361,18 @@ class SignalFilter:
         if p.volume_ratio_5m >= s.volume_ratio_heavy_threshold and p.change_15m < 1.5:
             self._stats.post_rej["量比异常"] += 1; return False, "疑似纯脉冲/异常量比"
 
+        # V2.9: 纯5m脉冲加强 — 5m暴涨但1h几乎不动
+        if p.change_5m > s.pulse_5m_change_threshold and p.change_1h < s.pulse_5m_1h_max:
+            self._stats.post_rej["纯脉冲"] += 1; return False, f"纯5m脉冲(5m={p.change_5m:.1f}% 1h={p.change_1h:.1f}%)"
+
+        # V2.9: 假突破检测 — 5m在涨但4h方向为负(逆大周期)
+        if p.change_5m > s.fake_breakout_5m_min and p.change_4h < 0:
+            self._stats.post_rej["假突破"] += 1; return False, f"疑似假突破(5m={p.change_5m:.1f}% 4h={p.change_4h:.1f}%)"
+
+        # V2.9: 24h过热尾段 — 24h涨幅高但近4h无延续(涨幅集中在早期)
+        if p.change_24h > s.tail_surge_24h_min and p.change_4h < 2.0:
+            self._stats.post_rej["尾段过热"] += 1; return False, f"24h尾段无延续(24h={p.change_24h:.1f}% 4h={p.change_4h:.1f}%)"
+
         ok, r = self.check_main_cooldown(signal)
         if not ok: self._stats.post_rej["cd"]+=1; return False,r
         self._ensure_daily()
@@ -411,7 +423,39 @@ class SignalFilter:
             return (f1, f2, f3, f4, f5, f6)
         return sorted(signals, key=_key, reverse=True)
 
-    # =================== 去重 ===================
+    # =================== 跨交易所去重 (V2.9) ===================
+    def cross_exchange_dedup(self, signals: list[Signal]) -> tuple[list[Signal], list[Signal]]:
+        """同币多交易所只保留最优版本，其余降入观察池。
+        返回 (保留的主推, 降级到观察池的)
+        """
+        if not self.settings.cross_exchange_dedup_enabled:
+            return signals, []
+
+        by_base: dict[str, list[Signal]] = defaultdict(list)
+        for sig in signals:
+            base = _base_symbol(sig.symbol)
+            by_base[base].append(sig)
+
+        kept: list[Signal] = []
+        demoted: list[Signal] = []
+        for base, group in by_base.items():
+            if len(group) == 1:
+                kept.append(group[0])
+                continue
+            # 多交易所同币: 按(评分, 24h成交额)取最优
+            group.sort(key=lambda s: (
+                s.score.total_score,
+                s.market_data.periods.turnover_24h,
+            ), reverse=True)
+            kept.append(group[0])
+            demoted.extend(group[1:])
+            if len(group) > 1:
+                logger.info(f"CrossDedup: {base} 保留 {group[0].source}({group[0].score.total_score:.0f}), "
+                            f"降级 {[s.source for s in group[1:]]}")
+
+        return kept, demoted
+
+    # =================== 叙事去重 ===================
     def cluster_dedup(self, signals: list[Signal]) -> list[Signal]:
         mpg = self.settings.cluster_max_per_group
         if self.is_calibration: mpg = max(mpg, 5)

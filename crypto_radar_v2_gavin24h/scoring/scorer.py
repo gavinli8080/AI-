@@ -7,6 +7,7 @@ import hashlib, time, logging
 from models import (
     MarketData, Signal, SignalPhase, ChaseRiskLevel, ChaseRiskDetail,
     ScoreBreakdown, ScoreGrade, TradingAdvice, PositionSize, HoldingWindow,
+    ExecutionLevel,
 )
 from config.settings import Settings
 
@@ -170,6 +171,10 @@ class SignalScorer:
         # V2.8: 尾段冲刺强惩罚
         if p.change_1h > 15 and p.change_24h > 20 and p.change_5m > 3:
             oh += 5; sb.penalty_reasons.append("尾段冲刺(1h/24h已热+5m还冲)")
+        # V2.9: 24h涨幅分布结构惩罚 — 涨幅集中在早期,近4h无延续空间
+        ts_min = getattr(s, 'tail_surge_24h_min', 10.0)
+        if p.change_24h > ts_min and p.change_4h < 2.0:
+            oh += 4; sb.penalty_reasons.append(f"24h涨幅早期集中(4h仅{p.change_4h:.1f}%)")
         sb.overheat_penalty = min(oh, 20)
 
         # 操纵风险 0-10
@@ -248,18 +253,26 @@ class SignalScorer:
         if phase == SignalPhase.REJECT:
             a.suggested_action="放弃"; a.suggested_position_size=PositionSize.IGNORE
             a.rejection_reason="; ".join(sc.reject_reasons) or "风险过高"
+            a.execution_level = ExecutionLevel.REJECT.value
         elif phase == SignalPhase.OVERHEATED:
             a.suggested_action="观察等回调"; a.suggested_position_size=PositionSize.IGNORE; a.rejection_reason="过热"
+            a.execution_level = ExecutionLevel.WATCH.value
         elif chase.should_wait_pullback:
             a.suggested_action="观察等回调"; a.suggested_position_size=PositionSize.IGNORE
+            # 追高风险中等但结构尚可 → 挂单; 高追高 → 仅观察
+            a.execution_level = ExecutionLevel.LIMIT_ONLY.value if chase.chase_risk_level == ChaseRiskLevel.MEDIUM else ExecutionLevel.WATCH.value
         elif phase == SignalPhase.STARTUP and sc.total_score >= max(P["act_start"], s.push_min_score):
             a.suggested_action="可轻仓试错"; a.suggested_position_size=PositionSize.LIGHT
+            a.execution_level = ExecutionLevel.MAIN_SIGNAL.value
         elif phase == SignalPhase.ACCELERATION and sc.total_score >= P["act_accel"]:
             a.suggested_action="可轻仓试错"; a.suggested_position_size=PositionSize.LIGHT
+            a.execution_level = ExecutionLevel.MAIN_SIGNAL.value
         elif sc.total_score >= P["act_strong"]:
             a.suggested_action="可轻仓试错"; a.suggested_position_size=PositionSize.MEDIUM
+            a.execution_level = ExecutionLevel.MAIN_SIGNAL.value
         else:
             a.suggested_action="观察等回调"; a.suggested_position_size=PositionSize.IGNORE
+            a.execution_level = ExecutionLevel.WATCH.value
 
         if p.change_4h < 8 and p.change_24h < 15: a.recommended_holding_window=HoldingWindow.H24
         elif p.change_1h < 12 and p.change_4h < 15: a.recommended_holding_window=HoldingWindow.H4
