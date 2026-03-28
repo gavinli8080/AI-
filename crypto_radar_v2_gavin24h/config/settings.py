@@ -148,11 +148,27 @@ class Settings:
 
     # V2.9.1: 唯一一单模式
     single_best_mode: bool = True       # 每轮主推最多保留N个
-    single_best_max_push: int = 2       # 最多推几个主推
-    single_best_min_score: float = 55.0 # 主推最低可接受分数(低于此不推)
+    single_best_max_push: int = 1       # 最多推几个主推 (V2.9.2: 1)
+    single_best_min_score: float = 58.0 # 主推最低可接受分数 (V2.9.2: 58)
+    single_best_confidence_gap: float = 8.0  # V2.9.2: top1和top2差距<此值→不够确定,不推
+    single_best_weak_threshold: float = 62.0 # V2.9.2: top1低于此值视为"勉强可做",不推
 
     # V2.9.1: 量比一致性
     vol_ratio_inconsistency_penalty: bool = True  # 5m高但15m/1h不跟→额外惩罚
+
+    # V2.9.2: 允许空轮 — 主推和观察池都不够时整轮静默
+    strict_empty_round_allowed: bool = True
+    # V2.9.2: fallback最低分门槛
+    fallback_min_score: float = 42.0
+    fallback_min_turnover_24h: float = 800_000
+
+    # V2.9.2: 大盘bearish时小所降级
+    market_regime_bearish_demote_minor_sources: bool = True  # bearish时gate/bybit/dex小币降级
+    market_regime_neutral_min_turnover_24h: float = 1_500_000  # neutral时主推最低24h额
+
+    # V2.9.2: 观察池更少更精
+    max_daily_watchlist_strict: int = 5        # V2.9.2: 5条
+    watchlist_min_turnover_24h: float = 500_000  # 观察池最低24h额
 
 
 def load_settings() -> Settings:
@@ -242,4 +258,13 @@ def load_settings() -> Settings:
     s.single_best_min_score = _ef("SINGLE_BEST_MIN_SCORE", 55.0)
     s.vol_ratio_inconsistency_penalty = _eb("VOL_RATIO_INCONSISTENCY_PENALTY", True)
     s.wl_recheck_max_deviation_pct = _ef("WL_RECHECK_MAX_DEVIATION_PCT", 2.5)
+    # V2.9.2
+    s.single_best_confidence_gap = _ef("SINGLE_BEST_CONFIDENCE_GAP", 8.0)
+    s.single_best_weak_threshold = _ef("SINGLE_BEST_WEAK_THRESHOLD", 62.0)
+    s.strict_empty_round_allowed = _eb("STRICT_EMPTY_ROUND_ALLOWED", True)
+    s.fallback_min_score = _ef("FALLBACK_MIN_SCORE", 42.0)
+    s.fallback_min_turnover_24h = _ef("FALLBACK_MIN_TURNOVER_24H", 800_000)
+    s.market_regime_bearish_demote_minor_sources = _eb("MARKET_REGIME_BEARISH_DEMOTE_MINOR_SOURCES", True)
+    s.market_regime_neutral_min_turnover_24h = _ef("MARKET_REGIME_NEUTRAL_MIN_TURNOVER_24H", 1_500_000)
+    s.watchlist_min_turnover_24h = _ef("WATCHLIST_MIN_TURNOVER_24H", 500_000)
     return s

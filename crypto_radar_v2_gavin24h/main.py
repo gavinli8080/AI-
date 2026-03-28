@@ -207,11 +207,22 @@ class CryptoRadar:
         # 10. Cross-exchange dedup (V2.9.1) — 同币多交易所只保留最优
         xd_kept, xd_demoted = self.filter.cross_exchange_dedup(pushed_cands)
 
-        # V2.9.1.1: Single-best ranking — 限制主推数量,溢出降入观察池
+        # V2.9.2: Single-best ranking — 多因子排序,不只看分数
         sb_overflow: list[Signal] = []
-        if s.single_best_mode and len(xd_kept) > s.single_best_max_push:
-            xd_kept.sort(key=lambda sig: sig.score.total_score, reverse=True)
-            # 低于 single_best_min_score 的直接溢出
+        if s.single_best_mode:
+            def _single_best_key(sig: Signal) -> tuple:
+                p = sig.market_data.periods
+                sc = sig.score.total_score
+                liq = 1 if p.turnover_24h > 2_000_000 else 0
+                pos = getattr(p, 'position_in_24h_range', 0.5)
+                low_pos = 1 if pos < 0.7 else 0
+                not_tail = 1 if not (p.change_24h > 10 and p.change_4h < 2) else 0
+                sk = sig.source.split(":")[0].lower() if ":" in sig.source else sig.source.lower()
+                top_exchange = 1 if sk in ("binance", "okx", "bitget") else 0
+                not_weak = 1 if not (0 < p.change_1h <= 2 and p.change_4h < 1.5 and p.change_24h < 0) else 0
+                return (liq, low_pos, not_tail, top_exchange, not_weak, sc)
+
+            xd_kept.sort(key=_single_best_key, reverse=True)
             real_kept: list[Signal] = []
             for sig in xd_kept:
                 if len(real_kept) < s.single_best_max_push and sig.score.total_score >= s.single_best_min_score:
@@ -326,6 +337,15 @@ class CryptoRadar:
             final_wl = wl_clean
 
         # ============================================================
+        # 12c. SINGLE-BEST FINAL GATE (V2.9.2) — 最终信心检验
+        # ============================================================
+        if s.single_best_mode:
+            before_gate = len(recheck_passed)
+            recheck_passed = self.filter.single_best_final_gate(recheck_passed)
+            if before_gate > 0 and len(recheck_passed) == 0:
+                logger.info(f"SingleBestGate: {before_gate} candidates → 0 (本轮无主推)")
+
+        # ============================================================
         # 13. PUSH 主推
         # ============================================================
         n_push = 0
@@ -351,26 +371,47 @@ class CryptoRadar:
         # 15. FALLBACK — 严格只从 valid_wl 选 (不混入 valid_main)
         # ============================================================
         if n_push == 0 and n_wl == 0 and s.push_watchlist_on_empty_main:
-            # V2.9.1.1: 只用观察池流中已过合法性的信号, 并过严格健康筛选
-            fb_pool = self.filter.filter_fallback_pool(valid_wl)
-            # 多因子排序
-            fb_ranked = self.filter.rank_for_fallback(fb_pool)
-            # 去重
-            fb_seen = set()
-            fb_final: list[Signal] = []
-            for sig in fb_ranked:
-                k = f"{sig.symbol}:{sig.source}"
-                if k not in fb_seen:
-                    fb_seen.add(k); fb_final.append(sig)
-                if len(fb_final) >= s.empty_main_watchlist_count: break
+            # V2.9.2: 允许空轮 — 如果开启strict_empty_round_allowed,不强制补fallback
+            if s.strict_empty_round_allowed:
+                # 只有真正高质量才fallback, 否则宁可静默
+                fb_pool = self.filter.filter_fallback_pool(valid_wl)
+                fb_ranked = self.filter.rank_for_fallback(fb_pool)
+                # 只取最多2个真正值得观察的
+                fb_seen = set()
+                fb_final: list[Signal] = []
+                for sig in fb_ranked:
+                    k = f"{sig.symbol}:{sig.source}"
+                    if k not in fb_seen:
+                        fb_seen.add(k); fb_final.append(sig)
+                    if len(fb_final) >= min(s.empty_main_watchlist_count, 2): break
 
-            if fb_final:
-                logger.info(f"Fallback: {len(fb_final)} from valid_wl only")
-                for sig in fb_final:
-                    self.db.save_signal(sig); self.filter.record_watchlist_push(sig)
-                try: await self.notifier.push_watchlist(fb_final, is_fallback=True)
-                except Exception as e: logger.error(f"FB err: {e}")
-                n_wl += len(fb_final)
+                if fb_final:
+                    logger.info(f"Fallback: {len(fb_final)} high-quality from valid_wl")
+                    for sig in fb_final:
+                        self.db.save_signal(sig); self.filter.record_watchlist_push(sig)
+                    try: await self.notifier.push_watchlist(fb_final, is_fallback=True)
+                    except Exception as e: logger.error(f"FB err: {e}")
+                    n_wl += len(fb_final)
+                else:
+                    logger.info("Fallback: 无高质量候选, 本轮静默")
+            else:
+                fb_pool = self.filter.filter_fallback_pool(valid_wl)
+                fb_ranked = self.filter.rank_for_fallback(fb_pool)
+                fb_seen = set()
+                fb_final: list[Signal] = []
+                for sig in fb_ranked:
+                    k = f"{sig.symbol}:{sig.source}"
+                    if k not in fb_seen:
+                        fb_seen.add(k); fb_final.append(sig)
+                    if len(fb_final) >= s.empty_main_watchlist_count: break
+
+                if fb_final:
+                    logger.info(f"Fallback: {len(fb_final)} from valid_wl only")
+                    for sig in fb_final:
+                        self.db.save_signal(sig); self.filter.record_watchlist_push(sig)
+                    try: await self.notifier.push_watchlist(fb_final, is_fallback=True)
+                    except Exception as e: logger.error(f"FB err: {e}")
+                    n_wl += len(fb_final)
 
         self.filter.record_round_signal_count(n_push, n_wl)
         self._end(t0, n_push, n_wl)

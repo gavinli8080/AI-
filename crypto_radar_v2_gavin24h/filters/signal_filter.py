@@ -404,6 +404,20 @@ class SignalFilter:
             if signal.score.total_score < s.market_regime_bearish_push_min_score:
                 self._stats.post_rej["大盘弱"] += 1
                 return False, f"大盘bearish需{s.market_regime_bearish_push_min_score:.0f}分(当前{signal.score.total_score:.0f})"
+            # V2.9.2: bearish时 gate/bybit/dex 小币直接降级
+            if s.market_regime_bearish_demote_minor_sources:
+                sk = _src_key(signal.source)
+                if sk in ("gate", "bybit", "dex", "dexscreener") and p.turnover_24h < 2_000_000:
+                    self._stats.post_rej["大盘弱小所"] += 1
+                    return False, f"bearish+小所({sk})流动性不足"
+
+        # V2.9.2: neutral时主推流动性门槛
+        if s.market_regime_enabled and self._market_regime == "neutral":
+            if p.turnover_24h > 0 and p.turnover_24h < s.market_regime_neutral_min_turnover_24h:
+                sk = _src_key(signal.source)
+                if sk not in ("binance", "okx"):
+                    self._stats.post_rej["neutral低额"] += 1
+                    return False, f"neutral非头部所24h额<${s.market_regime_neutral_min_turnover_24h:.0f}"
 
         ok, r = self.check_main_cooldown(signal)
         if not ok: self._stats.post_rej["cd"]+=1; return False,r
@@ -447,6 +461,14 @@ class SignalFilter:
         if pos >= s.high_position_demote_threshold:
             return False
 
+        # V2.9.2: 观察池流动性门槛 — 小币低流动性不进观察池
+        if p.turnover_24h > 0 and p.turnover_24h < s.watchlist_min_turnover_24h:
+            return False
+
+        # V2.9.2: 24h已转正但1h/4h不够强 → 不进观察池(只是慢修复)
+        if p.change_24h > 3 and p.change_1h < 2 and p.change_4h < 2:
+            return False
+
         # V2.9.1: 大盘弱时观察池门槛更高
         if s.market_regime_enabled and self._market_regime == "bearish":
             if signal.score.total_score < s.market_regime_bearish_wl_min_score:
@@ -479,15 +501,20 @@ class SignalFilter:
         return sorted(signals, key=_key, reverse=True)
 
     def filter_fallback_pool(self, signals: list[Signal]) -> list[Signal]:
-        """V2.9.1: fallback也要过最低健康标准,拒绝弱修复/高位/纯脉冲"""
+        """V2.9.2: fallback严格健康标准 — 只有真正高质量才进fallback"""
         s = self.settings
         result = []
         for sig in signals:
             p = sig.market_data.periods
             if sig.phase == SignalPhase.REJECT: continue
-            if sig.score.total_score <= 25: continue
+            # V2.9.2: fallback最低分
+            if sig.score.total_score < s.fallback_min_score: continue
+            # V2.9.2: fallback最低流动性
+            if p.turnover_24h > 0 and p.turnover_24h < s.fallback_min_turnover_24h: continue
             # 1h必须为正
             if p.change_1h <= 0: continue
+            # 4h也要为正 — fallback应该是真正有结构的
+            if p.change_4h <= 0: continue
             # 弱修复不进fallback
             if (0 < p.change_1h <= s.weak_repair_max_1h
                 and p.change_4h < s.weak_repair_max_4h
@@ -498,8 +525,42 @@ class SignalFilter:
             if pos >= s.high_position_demote_threshold: continue
             # 纯5m脉冲不进fallback
             if p.change_5m > s.pulse_5m_change_threshold and p.change_1h < s.pulse_5m_1h_max: continue
+            # V2.9.2: 尾段不进fallback
+            if p.change_24h > s.tail_surge_24h_min and p.change_4h < 2.0: continue
             result.append(sig)
         return result
+
+    # =================== 唯一一单最终闸门 (V2.9.2) ===================
+    def single_best_final_gate(self, signals: list[Signal]) -> list[Signal]:
+        """最终推送前的信心检验:
+        - top1 低于 weak_threshold → 不推 (勉强可做 ≠ 值得做)
+        - top1 和 top2 差距太小 → 不够确定,不推
+        - 允许返回空列表 (本轮无主推)
+        """
+        s = self.settings
+        if not s.single_best_mode or not signals:
+            return signals
+
+        signals.sort(key=lambda sig: sig.score.total_score, reverse=True)
+        top1 = signals[0]
+
+        # 最高分不够强 → 本轮无值得打的一枪
+        if top1.score.total_score < s.single_best_weak_threshold:
+            logger.info(f"SingleBestGate: top1 {top1.symbol} score={top1.score.total_score:.0f} "
+                        f"< weak_threshold={s.single_best_weak_threshold:.0f}, 本轮放弃")
+            return []
+
+        # 有多个候选但差距不明显 → 不够确定
+        if len(signals) >= 2:
+            top2 = signals[1]
+            gap = top1.score.total_score - top2.score.total_score
+            if gap < s.single_best_confidence_gap and top1.score.total_score < 70:
+                logger.info(f"SingleBestGate: top1={top1.score.total_score:.0f} top2={top2.score.total_score:.0f} "
+                            f"gap={gap:.0f} < {s.single_best_confidence_gap:.0f}, 不够确定")
+                return []
+
+        # 只返回 top1
+        return [top1]
 
     # =================== 跨交易所去重 (V2.9) ===================
     def cross_exchange_dedup(self, signals: list[Signal]) -> tuple[list[Signal], list[Signal]]:
