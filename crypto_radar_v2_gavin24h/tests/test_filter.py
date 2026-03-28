@@ -150,7 +150,7 @@ class TestWeakRepairFilter(unittest.TestCase):
 
     def test_weak_repair_rejected(self):
         """24h跌+1h微涨+量比不足 → 弱修复拒绝"""
-        sig = _sig(score=55, change_5m=1.0, change_1h=1.5, change_4h=1.0,
+        sig = _sig(score=60, change_5m=1.0, change_1h=1.5, change_4h=1.0,
                    change_15m=1.5, change_24h=-5.0,
                    turnover_24h=2_000_000, turnover_1h=200_000,
                    volume_ratio_5m=1.2)
@@ -175,7 +175,7 @@ class TestHighPositionFilter(unittest.TestCase):
         self.f.new_round(100)
 
     def test_high_position_rejected(self):
-        """24h区间顶部(>92%) → 拒绝"""
+        """24h区间位置>62% → 拒绝(V3.0硬门槛)"""
         sig = _sig(score=65, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                    change_15m=3.0, change_24h=8.0,
                    turnover_24h=2_000_000, turnover_1h=200_000,
@@ -183,7 +183,7 @@ class TestHighPositionFilter(unittest.TestCase):
                    high_24h=1.1, low_24h=0.9)
         ok, reason = self.f.post_filter(sig)
         self.assertFalse(ok)
-        self.assertIn("顶部", reason)
+        self.assertIn("24h区间位置", reason)
 
 
 class TestMarketRegimeFilter(unittest.TestCase):
@@ -193,9 +193,9 @@ class TestMarketRegimeFilter(unittest.TestCase):
         self.f.new_round(100)
 
     def test_bearish_regime_blocks_low_score(self):
-        """大盘bearish时,低分信号被阻挡"""
+        """大盘bearish时,低分信号被阻挡(V3.0门槛70)"""
         self.f.set_market_regime("bearish")
-        sig = _sig(score=58, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+        sig = _sig(score=65, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                    change_15m=3.0, change_24h=8.0,
                    turnover_24h=2_000_000, turnover_1h=200_000,
                    volume_ratio_5m=2.5)
@@ -217,21 +217,22 @@ class TestMarketRegimeFilter(unittest.TestCase):
 class TestSingleBestFinalGate(unittest.TestCase):
     def setUp(self):
         self.settings = Settings(scoring_mode="strict", single_best_mode=True,
-                                 single_best_weak_threshold=62.0,
-                                 single_best_confidence_gap=8.0)
+                                 single_best_min_score=60.0,
+                                 single_best_min_edge=6.0,
+                                 single_best_require_clear_win=True)
         self.f = SignalFilter(self.settings)
         self.f.new_round(100)
 
     def test_weak_top1_rejected(self):
-        """top1分数<62 → 勉强可做,不推"""
-        sig = _sig(score=59, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+        """top1分数<60 → 不够格,不推"""
+        sig = _sig(score=55, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                    change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                    turnover_1h=200_000, volume_ratio_5m=2.5)
         result = self.f.single_best_final_gate([sig])
         self.assertEqual(len(result), 0)
 
     def test_strong_top1_passes(self):
-        """top1分数>=62 → 通过"""
+        """top1分数>=60且结构健康 → 通过"""
         sig = _sig(score=68, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                    change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                    turnover_1h=200_000, volume_ratio_5m=2.5)
@@ -239,7 +240,7 @@ class TestSingleBestFinalGate(unittest.TestCase):
         self.assertEqual(len(result), 1)
 
     def test_close_scores_rejected(self):
-        """top1和top2差距<8且top1<70 → 不够确定"""
+        """top1和top2差距<6且top1<72 → 不够确定"""
         sig1 = _sig("A/USDT", score=65, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                     change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                     turnover_1h=200_000, volume_ratio_5m=2.5)
@@ -250,7 +251,7 @@ class TestSingleBestFinalGate(unittest.TestCase):
         self.assertEqual(len(result), 0)
 
     def test_clear_winner_passes(self):
-        """top1明显领先 → 通过"""
+        """top1明显领先(gap>=6) → 通过"""
         sig1 = _sig("A/USDT", score=75, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                     change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                     turnover_1h=200_000, volume_ratio_5m=2.5)

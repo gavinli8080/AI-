@@ -393,31 +393,46 @@ class SignalFilter:
             self._stats.post_rej["弱修复"] += 1
             return False, f"弱修复(1h={p.change_1h:.1f}% 4h={p.change_4h:.1f}% vr={p.volume_ratio_5m:.1f}x 24h={p.change_24h:.1f}%)"
 
-        # V2.9.1: 24h区间高位 — 价格接近24h最高点,上方空间不足
+        # V3.0: 24h区间位置硬门槛 — 位置太高直接拒绝
         pos = getattr(p, 'position_in_24h_range', 0.5)
-        if pos >= s.high_position_reject_threshold:
+        if pos >= s.main_max_position:
             self._stats.post_rej["高位拒绝"] += 1
-            return False, f"24h区间顶部({pos:.0%})"
+            return False, f"24h区间位置{pos:.0%}>{s.main_max_position:.0%}"
 
-        # V2.9.1: 大盘环境加分门槛 — bearish时主推需更高分
-        if s.market_regime_enabled and self._market_regime == "bearish":
-            if signal.score.total_score < s.market_regime_bearish_push_min_score:
-                self._stats.post_rej["大盘弱"] += 1
-                return False, f"大盘bearish需{s.market_regime_bearish_push_min_score:.0f}分(当前{signal.score.total_score:.0f})"
-            # V2.9.2: bearish时 gate/bybit/dex 小币直接降级
-            if s.market_regime_bearish_demote_minor_sources:
-                sk = _src_key(signal.source)
-                if sk in ("gate", "bybit", "dex", "dexscreener") and p.turnover_24h < 2_000_000:
-                    self._stats.post_rej["大盘弱小所"] += 1
-                    return False, f"bearish+小所({sk})流动性不足"
+        # V3.0: 慢修复 — 24h跌+1h<3%+4h<4%→结构太弱不可主推
+        if p.change_24h < 0 and p.change_1h < s.slow_repair_min_1h and p.change_4h < s.slow_repair_min_4h:
+            self._stats.post_rej["慢修复"] += 1
+            return False, f"慢修复(1h={p.change_1h:.1f}% 4h={p.change_4h:.1f}% 24h={p.change_24h:.1f}%)"
 
-        # V2.9.2: neutral时主推流动性门槛
-        if s.market_regime_enabled and self._market_regime == "neutral":
-            if p.turnover_24h > 0 and p.turnover_24h < s.market_regime_neutral_min_turnover_24h:
-                sk = _src_key(signal.source)
-                if sk not in ("binance", "okx"):
-                    self._stats.post_rej["neutral低额"] += 1
-                    return False, f"neutral非头部所24h额<${s.market_regime_neutral_min_turnover_24h:.0f}"
+        # V3.0: 纯15m脉冲 — 15m暴涨但1h/4h不跟
+        if s.pure_15m_pulse_reject and p.change_15m > 6 and p.change_1h < 3 and p.change_4h < 2:
+            self._stats.post_rej["15m脉冲"] += 1
+            return False, f"纯15m脉冲(15m={p.change_15m:.1f}% 1h={p.change_1h:.1f}%)"
+
+        # V3.0: 高位反抽强惩罚 — 24h已热+位置高+4h弱
+        if s.high_position_bounce_penalty and pos >= 0.7 and p.change_24h > 8 and p.change_4h < 3:
+            self._stats.post_rej["高位反抽"] += 1
+            return False, f"高位反抽(pos={pos:.0%} 24h={p.change_24h:.1f}% 4h={p.change_4h:.1f}%)"
+
+        # V3.0: 大盘环境 — 4级门控
+        sk = _src_key(signal.source)
+        regime = self._market_regime
+        if s.market_regime_enabled:
+            if regime == "bearish":
+                if signal.score.total_score < s.market_regime_bearish_push_min_score:
+                    self._stats.post_rej["大盘弱"] += 1
+                    return False, f"bearish需{s.market_regime_bearish_push_min_score:.0f}分"
+                if s.bearish_disable_small_cap_main and sk in ("gate", "bybit", "dex", "dexscreener"):
+                    self._stats.post_rej["bearish小所"] += 1
+                    return False, f"bearish关闭小所({sk})主推"
+            elif regime == "weak_neutral":
+                if s.weak_neutral_strict_main:
+                    if p.turnover_24h > 0 and p.turnover_24h < s.weak_neutral_min_turnover_24h:
+                        self._stats.post_rej["weak_neutral低额"] += 1
+                        return False, f"weak_neutral需24h额>{s.weak_neutral_min_turnover_24h/1e6:.0f}M"
+                    if sk in ("gate", "bybit", "dex", "dexscreener") and p.turnover_24h < 3_000_000:
+                        self._stats.post_rej["weak_neutral小所"] += 1
+                        return False, f"weak_neutral小所({sk})流动性不足"
 
         ok, r = self.check_main_cooldown(signal)
         if not ok: self._stats.post_rej["cd"]+=1; return False,r
@@ -428,56 +443,67 @@ class SignalFilter:
             self._stats.post_rej["熔断"]+=1; return False,"熔断"
         self._stats.post_filter_passed += 1; return True,"ok"
 
-    # =================== Watchlist候选 ===================
+    # =================== Watchlist = 监控池 (V3.0) ===================
     def is_watchlist_candidate(self, signal: Signal) -> bool:
-        """调用方必须已确保 signal 通过合法性校验"""
+        """V3.0: 观察池=监控池, 只收真正值得继续盯的, 不是实盘备选"""
         s = self.settings
-        # V2.9.1: 使用更严格的观察池最低分
         wl_min = max(s.watchlist_min_score, s.watchlist_min_score_strict)
-        if self._adaptive: wl_min = max(wl_min - s.adaptive_watchlist_score_relax, 20)
+        if self._adaptive: wl_min = max(wl_min - s.adaptive_watchlist_score_relax, 25)
         if signal.phase == SignalPhase.REJECT: return False
         if signal.score.total_score < wl_min: return False
         p = signal.market_data.periods
 
-        # V2.9.1: 观察池也要求1h>0
-        if s.watchlist_require_positive_1h and p.change_1h <= 0:
-            return False
-
+        # 1h必须为正
+        if s.watchlist_require_positive_1h and p.change_1h <= 0: return False
+        # 杠杆代币更严
         if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist:
-            if p.change_1h <= 0 or p.change_4h <= 0:
+            if p.change_1h <= 0 or p.change_4h <= 0: return False
+        # 24h过热
+        if p.change_24h > s.watchlist_reject_if_24h_overheat: return False
+
+        # 弱修复不收
+        if (0 < p.change_1h <= s.weak_repair_max_1h and p.change_4h < s.weak_repair_max_4h
+            and p.volume_ratio_5m < s.weak_repair_min_vr5m and p.change_24h < 0):
+            return False
+        # 慢修复不收
+        if s.watchlist_reject_slow_repair and p.change_24h < 0:
+            if p.change_1h < s.slow_repair_min_1h and p.change_4h < s.slow_repair_min_4h:
                 return False
-        if p.change_24h > s.watchlist_reject_if_24h_overheat:
-            return False
+        # 无量修复不收
+        if s.watchlist_reject_no_volume_repair and p.change_24h < 0:
+            if p.volume_ratio_5m < 1.3 and p.volume_ratio_15m < 1.2: return False
 
-        # V2.9.1: 弱修复也不进观察池
-        if (0 < p.change_1h <= s.weak_repair_max_1h
-            and p.change_4h < s.weak_repair_max_4h
-            and p.volume_ratio_5m < s.weak_repair_min_vr5m
-            and p.change_24h < 0):
-            return False
-
-        # V2.9.1: 24h高位也不进观察池
+        # 24h高位不收
         pos = getattr(p, 'position_in_24h_range', 0.5)
-        if pos >= s.high_position_demote_threshold:
+        if pos >= s.watchlist_max_position: return False
+        # 高位反抽不收
+        if s.watchlist_reject_high_position_bounce and pos >= 0.65 and p.change_24h > 5 and p.change_4h < 2:
             return False
 
-        # V2.9.2: 观察池流动性门槛 — 小币低流动性不进观察池
-        if p.turnover_24h > 0 and p.turnover_24h < s.watchlist_min_turnover_24h:
+        # 流动性门槛
+        if p.turnover_24h > 0 and p.turnover_24h < s.watchlist_min_turnover_24h: return False
+        # 24h转正但1h/4h弱 = 假止跌, 不收
+        if s.watchlist_require_real_continuation and p.change_24h > 2 and p.change_1h < 2 and p.change_4h < 2:
             return False
+        # 纯脉冲不收
+        if p.change_5m > s.pulse_5m_change_threshold and p.change_1h < s.pulse_5m_1h_max: return False
+        # 量比不一致(5m高15m不跟)不收
+        if p.volume_ratio_5m > 5 and p.volume_ratio_15m < 1.3: return False
 
-        # V2.9.2: 24h已转正但1h/4h不够强 → 不进观察池(只是慢修复)
-        if p.change_24h > 3 and p.change_1h < 2 and p.change_4h < 2:
-            return False
-
-        # V2.9.1: 大盘弱时观察池门槛更高
-        if s.market_regime_enabled and self._market_regime == "bearish":
-            if signal.score.total_score < s.market_regime_bearish_wl_min_score:
-                return False
+        # 大盘环境
+        regime = self._market_regime
+        if s.market_regime_enabled:
+            if regime == "bearish":
+                if signal.score.total_score < s.market_regime_bearish_wl_min_score: return False
+                if s.bearish_strict_watchlist:
+                    sk = _src_key(signal.source)
+                    if sk in ("gate", "bybit", "dex", "dexscreener"): return False
+            elif regime == "weak_neutral" and s.weak_neutral_strict_watchlist:
+                if signal.score.total_score < 45: return False
 
         ok, _ = self.check_watchlist_cooldown(signal)
         if not ok: return False
         self._ensure_daily()
-        # V2.9.1: 使用更严格的每日观察池上限
         max_wl = min(s.max_daily_watchlist, s.max_daily_watchlist_strict)
         return self._daily_wl < max_wl
 
@@ -501,65 +527,106 @@ class SignalFilter:
         return sorted(signals, key=_key, reverse=True)
 
     def filter_fallback_pool(self, signals: list[Signal]) -> list[Signal]:
-        """V2.9.2: fallback严格健康标准 — 只有真正高质量才进fallback"""
+        """V3.0: fallback几乎不用 — 只有极高质量才进, 否则宁可空轮"""
         s = self.settings
+        # bearish时直接关闭fallback
+        if s.market_regime_enabled and self._market_regime == "bearish" and s.bearish_disable_fallback:
+            return []
         result = []
         for sig in signals:
             p = sig.market_data.periods
             if sig.phase == SignalPhase.REJECT: continue
-            # V2.9.2: fallback最低分
             if sig.score.total_score < s.fallback_min_score: continue
-            # V2.9.2: fallback最低流动性
             if p.turnover_24h > 0 and p.turnover_24h < s.fallback_min_turnover_24h: continue
-            # 1h必须为正
+            if p.turnover_1h > 0 and p.turnover_1h < s.fallback_min_turnover_1h: continue
             if p.change_1h <= 0: continue
-            # 4h也要为正 — fallback应该是真正有结构的
-            if p.change_4h <= 0: continue
-            # 弱修复不进fallback
-            if (0 < p.change_1h <= s.weak_repair_max_1h
-                and p.change_4h < s.weak_repair_max_4h
-                and p.volume_ratio_5m < s.weak_repair_min_vr5m
-                and p.change_24h < 0): continue
-            # 24h高位不进fallback
+            if p.change_4h < 0: continue
+            if p.change_24h > s.fallback_max_24h_change: continue
+            # 位置门槛
             pos = getattr(p, 'position_in_24h_range', 0.5)
-            if pos >= s.high_position_demote_threshold: continue
-            # 纯5m脉冲不进fallback
+            if s.fallback_reject_high_position and pos >= s.fallback_max_position: continue
+            # 慢修复/弱修复
+            if s.fallback_reject_slow_repair and p.change_24h < 0:
+                if p.change_1h < s.slow_repair_min_1h or p.change_4h < s.slow_repair_min_4h: continue
+            if (0 < p.change_1h <= s.weak_repair_max_1h and p.change_4h < s.weak_repair_max_4h
+                and p.volume_ratio_5m < s.weak_repair_min_vr5m and p.change_24h < 0): continue
+            # 纯脉冲
             if p.change_5m > s.pulse_5m_change_threshold and p.change_1h < s.pulse_5m_1h_max: continue
-            # V2.9.2: 尾段不进fallback
+            if p.change_15m > 6 and p.change_1h < 3 and p.change_4h < 2: continue
+            # 尾段
             if p.change_24h > s.tail_surge_24h_min and p.change_4h < 2.0: continue
+            # 量比异常
+            if p.volume_ratio_5m >= s.volume_ratio_heavy_threshold and p.change_15m < 1.5: continue
+            if p.volume_ratio_5m > 5 and p.volume_ratio_15m < 1.3: continue
+            # 小所小币
+            if s.fallback_reject_small_exchange:
+                sk = _src_key(sig.source)
+                if sk in ("gate", "bybit", "dex", "dexscreener") and p.turnover_24h < 3_000_000: continue
             result.append(sig)
         return result
 
-    # =================== 唯一一单最终闸门 (V2.9.2) ===================
+    # =================== 唯一一单最终闸门 (V3.0) ===================
     def single_best_final_gate(self, signals: list[Signal]) -> list[Signal]:
-        """最终推送前的信心检验:
-        - top1 低于 weak_threshold → 不推 (勉强可做 ≠ 值得做)
-        - top1 和 top2 差距太小 → 不够确定,不推
-        - 允许返回空列表 (本轮无主推)
+        """V3.0: 今天有没有值得打的一枪? 不是今天排第一的是谁。
+        - top1 低于 min_score → 不推
+        - top1 是慢修复/尾段/小所噪音 → 不推
+        - top1 和 top2 差距 < min_edge 且 top1 < 72 → 不够确定
+        - require_clear_win: top1 必须有结构优势
+        - 允许返回空列表
         """
         s = self.settings
         if not s.single_best_mode or not signals:
             return signals
 
-        signals.sort(key=lambda sig: sig.score.total_score, reverse=True)
-        top1 = signals[0]
+        # 多因子排序: 不只看分数
+        def _final_key(sig: Signal) -> tuple:
+            p = sig.market_data.periods
+            sk = _src_key(sig.source)
+            suitable = 1 if sig.advice.is_suitable_for_24h_trade else 0
+            pos = getattr(p, 'position_in_24h_range', 0.5)
+            low_pos = 1 if pos < 0.55 else 0
+            coordinated = 1 if (2 < p.change_1h < 15 and 1 < p.change_4h < 20) else 0
+            not_tail = 1 if not (p.change_24h > 10 and p.change_4h < 2) else 0
+            not_slow = 1 if not (p.change_24h < 0 and p.change_1h < 3) else 0
+            not_pulse = 1 if not (p.change_5m > 5 and p.change_15m < 1.5) else 0
+            liq = 1 if p.turnover_24h > 2_000_000 else 0
+            top_ex = 1 if sk in ("binance", "okx", "bitget") else 0
+            return (suitable, low_pos, coordinated, not_tail, not_slow, not_pulse, liq, top_ex, sig.score.total_score)
 
-        # 最高分不够强 → 本轮无值得打的一枪
-        if top1.score.total_score < s.single_best_weak_threshold:
+        signals.sort(key=_final_key, reverse=True)
+        top1 = signals[0]
+        p1 = top1.market_data.periods
+
+        # 分数不够 → 本轮无
+        if top1.score.total_score < s.single_best_min_score:
             logger.info(f"SingleBestGate: top1 {top1.symbol} score={top1.score.total_score:.0f} "
-                        f"< weak_threshold={s.single_best_weak_threshold:.0f}, 本轮放弃")
+                        f"< {s.single_best_min_score:.0f}, 放弃")
             return []
 
-        # 有多个候选但差距不明显 → 不够确定
+        # require_clear_win: top1必须有真正的结构优势
+        if s.single_best_require_clear_win:
+            # 慢修复不配当唯一一单
+            if p1.change_24h < 0 and p1.change_1h < s.slow_repair_min_1h:
+                logger.info(f"SingleBestGate: top1 {top1.symbol} 慢修复不推")
+                return []
+            # 尾段不配当唯一一单
+            if p1.change_24h > s.tail_surge_24h_min and p1.change_4h < 2:
+                logger.info(f"SingleBestGate: top1 {top1.symbol} 尾段不推")
+                return []
+            # 纯脉冲不配
+            if p1.change_5m > 5 and p1.change_15m < 1.5:
+                logger.info(f"SingleBestGate: top1 {top1.symbol} 纯脉冲不推")
+                return []
+
+        # 有多个候选且差距不明显 → 不够确定
         if len(signals) >= 2:
             top2 = signals[1]
             gap = top1.score.total_score - top2.score.total_score
-            if gap < s.single_best_confidence_gap and top1.score.total_score < 70:
-                logger.info(f"SingleBestGate: top1={top1.score.total_score:.0f} top2={top2.score.total_score:.0f} "
-                            f"gap={gap:.0f} < {s.single_best_confidence_gap:.0f}, 不够确定")
+            if gap < s.single_best_min_edge and top1.score.total_score < 72:
+                logger.info(f"SingleBestGate: gap={gap:.0f} < {s.single_best_min_edge:.0f}, "
+                            f"top1={top1.score.total_score:.0f} top2={top2.score.total_score:.0f}, 不够确定")
                 return []
 
-        # 只返回 top1
         return [top1]
 
     # =================== 跨交易所去重 (V2.9) ===================

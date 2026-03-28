@@ -153,10 +153,13 @@ class SignalScorer:
         # 1h/4h/24h协调加分
         if 2 < p.change_1h < 15 and 3 < p.change_4h < 20 and p.change_24h < 25:
             c+=3; sb.score_reasons.append("1h/4h/24h协调")
-        # V2.9.1: 24h区间位置加分 — 低位启动更有空间
+        # V3.0: 24h区间位置加分 — 低位+1h/4h转强=真正有空间
         pos = getattr(p, 'position_in_24h_range', 0.5)
-        if pos < 0.4:
-            c += 2; sb.score_reasons.append(f"低位启动({pos:.0%})")
+        if s.low_position_repair_bonus and pos < 0.4:
+            if p.change_1h > 2 and p.change_4h > 1:
+                c += 3; sb.score_reasons.append(f"低位转强({pos:.0%})")
+            else:
+                c += 1; sb.score_reasons.append(f"低位({pos:.0%})")
         sb.continuation_score = min(c, 15)
 
         # 突破质量 0-10
@@ -181,12 +184,18 @@ class SignalScorer:
         if p.change_24h > ts_min and p.change_4h < 2.0:
             oh += 4; sb.penalty_reasons.append(f"24h涨幅早期集中(4h仅{p.change_4h:.1f}%)")
 
-        # V2.9.1: 24h区间位置惩罚 — 价格接近24h高点,上方空间有限
+        # V3.0: 24h区间位置惩罚 — 更严格
         pos = getattr(p, 'position_in_24h_range', 0.5)
         if pos >= s.high_position_reject_threshold:
-            oh += 6; sb.penalty_reasons.append(f"24h区间顶部({pos:.0%})")
+            oh += 8; sb.penalty_reasons.append(f"24h区间顶部({pos:.0%})")
         elif pos >= s.high_position_demote_threshold:
-            oh += 3; sb.penalty_reasons.append(f"24h区间偏高({pos:.0%})")
+            oh += 4; sb.penalty_reasons.append(f"24h区间偏高({pos:.0%})")
+        elif pos >= 0.7:
+            oh += 2; sb.penalty_reasons.append(f"24h偏上({pos:.0%})")
+
+        # V3.0: 高位反抽 — 24h已热+位置偏高+4h弱
+        if s.high_position_bounce_penalty and pos >= 0.65 and p.change_24h > 8 and p.change_4h < 3:
+            oh += 5; sb.penalty_reasons.append(f"高位反抽(pos={pos:.0%} 24h={p.change_24h:.0f}%)")
 
         # V2.9.1: 弱修复/死猫跳惩罚 — 1h/4h涨幅微弱+量比不足=无力反弹
         if (0 < p.change_1h <= s.weak_repair_max_1h
@@ -219,10 +228,18 @@ class SignalScorer:
         if p.change_5m > 5 and p.change_15m < 1.5 and p.change_1h < 3:
             mp+=3; sb.penalty_reasons.append("纯5m脉冲")
 
-        # V2.9.1: 量比不一致惩罚 — 5m量比高但15m/1h不跟随=单根异常
+        # V3.0: 量比不一致惩罚 — 5m量比高但15m不跟=单根异常
         if s.vol_ratio_inconsistency_penalty:
             if p.volume_ratio_5m > 5.0 and p.volume_ratio_15m < 1.5:
                 mp += 3; sb.penalty_reasons.append(f"量比不一致(5m={p.volume_ratio_5m:.0f}x 15m={p.volume_ratio_15m:.1f}x)")
+            # 5m/15m都高但1h不承接
+            elif p.volume_ratio_5m > 3.0 and p.volume_ratio_15m > 2.0:
+                if p.change_1h < 2 and p.change_4h < 1:
+                    mp += 2; sb.penalty_reasons.append("量比短时好看但1h/4h不承接")
+
+        # V3.0: 纯15m脉冲
+        if getattr(s, 'pure_15m_pulse_reject', True) and p.change_15m > 6 and p.change_1h < 3 and p.change_4h < 2:
+            mp += 3; sb.penalty_reasons.append(f"纯15m脉冲(15m={p.change_15m:.1f}% 1h={p.change_1h:.1f}%)")
 
         sb.manipulation_risk_penalty = min(mp, 10)
 

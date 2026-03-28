@@ -1,7 +1,7 @@
 """
-Crypto Radar V2 (V2.9.1.1)
-严格双流隔离, fallback仅从合法观察池选, 多因子fallback排序
-V2.9.1.1: market regime, single-best, watchlist recheck, tighter fallback
+Crypto Radar V2 (V3.0)
+24小时短线唯一实盘单筛选器
+V3.0: 4级大盘环境, 唯一一单闸门, 观察池=监控池, 允许空轮
 """
 from __future__ import annotations
 import sys, os, asyncio, logging, time, argparse
@@ -59,7 +59,7 @@ class CryptoRadar:
             self.sources.append(src); self.source_map["dexscreener"] = src; self.tracker.register_source("dexscreener", src)
 
     def _detect_market_regime(self, all_md: list[MarketData]) -> str:
-        """V2.9.1.1: 根据 BTC/ETH 的 1h/4h 状态判断大盘环境"""
+        """V3.0: 4级大盘环境 bullish/neutral/weak_neutral/bearish"""
         if not self.settings.market_regime_enabled:
             return "neutral"
         btc_md = None
@@ -72,16 +72,22 @@ class CryptoRadar:
 
         bear_signals = 0
         bull_signals = 0
+        weak_signals = 0  # 偏弱但不到bearish
         for ref in [btc_md, eth_md]:
             if ref is None: continue
             p = ref.periods
+            # bearish信号
             if p.change_1h < -2: bear_signals += 1
+            elif p.change_1h < -0.5: weak_signals += 1
             elif p.change_1h > 1: bull_signals += 1
             if p.change_4h < -3: bear_signals += 1
+            elif p.change_4h < -1: weak_signals += 1
             elif p.change_4h > 2: bull_signals += 1
 
         if bear_signals >= 3: return "bearish"
+        if bear_signals >= 2 or (bear_signals >= 1 and weak_signals >= 2): return "weak_neutral"
         if bull_signals >= 3: return "bullish"
+        if weak_signals >= 2: return "weak_neutral"
         return "neutral"
 
     async def load_caches(self):
@@ -106,7 +112,7 @@ class CryptoRadar:
             if isinstance(r, list): all_md.extend(r)
             elif isinstance(r, Exception): logger.error(f"{self.sources[i].name}: {r}")
         logger.info(f"Tickers: {len(all_md)}")
-        # V2.9.1.1: 大盘环境检测
+        # V3.0.1: 大盘环境检测
         regime = self._detect_market_regime(all_md)
         self.filter.set_market_regime(regime)
         rs = self.filter.new_round(len(all_md))
@@ -204,7 +210,7 @@ class CryptoRadar:
             if ok: pushed_cands.append(sig)
             else: main_overflow.append(sig)
 
-        # 10. Cross-exchange dedup (V2.9.1) — 同币多交易所只保留最优
+        # 10. Cross-exchange dedup (V3.0) — 同币多交易所只保留最优
         xd_kept, xd_demoted = self.filter.cross_exchange_dedup(pushed_cands)
 
         # V2.9.2: Single-best ranking — 多因子排序,不只看分数
@@ -255,7 +261,7 @@ class CryptoRadar:
         final_wl = final_wl[:s.max_daily_watchlist]
 
         # ============================================================
-        # 12. PRE-PUSH PRICE RECHECK (V2.9.1) — 推送前实时价格复核
+        # 12. PRE-PUSH PRICE RECHECK (V3.0) — 推送前实时价格复核
         # ============================================================
         recheck_passed: list[Signal] = []
         recheck_demoted: list[Signal] = []
@@ -302,7 +308,7 @@ class CryptoRadar:
         logger.info(f"Recheck: passed={len(recheck_passed)} demoted={len(recheck_demoted)}")
 
         # ============================================================
-        # 12b. WATCHLIST RECHECK (V2.9.1.1) — 观察池也做价格复核
+        # 12b. WATCHLIST RECHECK (V3.0.1) — 观察池也做价格复核
         # ============================================================
         if s.recheck_enabled and final_wl:
             wl_rc_sem = asyncio.Semaphore(5)
@@ -371,47 +377,26 @@ class CryptoRadar:
         # 15. FALLBACK — 严格只从 valid_wl 选 (不混入 valid_main)
         # ============================================================
         if n_push == 0 and n_wl == 0 and s.push_watchlist_on_empty_main:
-            # V2.9.2: 允许空轮 — 如果开启strict_empty_round_allowed,不强制补fallback
-            if s.strict_empty_round_allowed:
-                # 只有真正高质量才fallback, 否则宁可静默
-                fb_pool = self.filter.filter_fallback_pool(valid_wl)
-                fb_ranked = self.filter.rank_for_fallback(fb_pool)
-                # 只取最多2个真正值得观察的
-                fb_seen = set()
-                fb_final: list[Signal] = []
-                for sig in fb_ranked:
-                    k = f"{sig.symbol}:{sig.source}"
-                    if k not in fb_seen:
-                        fb_seen.add(k); fb_final.append(sig)
-                    if len(fb_final) >= min(s.empty_main_watchlist_count, 2): break
+            # V3.0: fallback极严格 — 只有真正高质量才补, 否则静默
+            fb_pool = self.filter.filter_fallback_pool(valid_wl)
+            fb_ranked = self.filter.rank_for_fallback(fb_pool)
+            fb_seen = set()
+            fb_final: list[Signal] = []
+            for sig in fb_ranked:
+                k = f"{sig.symbol}:{sig.source}"
+                if k not in fb_seen:
+                    fb_seen.add(k); fb_final.append(sig)
+                if len(fb_final) >= s.empty_main_watchlist_count: break
 
-                if fb_final:
-                    logger.info(f"Fallback: {len(fb_final)} high-quality from valid_wl")
-                    for sig in fb_final:
-                        self.db.save_signal(sig); self.filter.record_watchlist_push(sig)
-                    try: await self.notifier.push_watchlist(fb_final, is_fallback=True)
-                    except Exception as e: logger.error(f"FB err: {e}")
-                    n_wl += len(fb_final)
-                else:
-                    logger.info("Fallback: 无高质量候选, 本轮静默")
-            else:
-                fb_pool = self.filter.filter_fallback_pool(valid_wl)
-                fb_ranked = self.filter.rank_for_fallback(fb_pool)
-                fb_seen = set()
-                fb_final: list[Signal] = []
-                for sig in fb_ranked:
-                    k = f"{sig.symbol}:{sig.source}"
-                    if k not in fb_seen:
-                        fb_seen.add(k); fb_final.append(sig)
-                    if len(fb_final) >= s.empty_main_watchlist_count: break
-
-                if fb_final:
-                    logger.info(f"Fallback: {len(fb_final)} from valid_wl only")
-                    for sig in fb_final:
-                        self.db.save_signal(sig); self.filter.record_watchlist_push(sig)
-                    try: await self.notifier.push_watchlist(fb_final, is_fallback=True)
-                    except Exception as e: logger.error(f"FB err: {e}")
-                    n_wl += len(fb_final)
+            if fb_final:
+                logger.info(f"Fallback: {len(fb_final)} high-quality from valid_wl")
+                for sig in fb_final:
+                    self.db.save_signal(sig); self.filter.record_watchlist_push(sig)
+                try: await self.notifier.push_watchlist(fb_final, is_fallback=True)
+                except Exception as e: logger.error(f"FB err: {e}")
+                n_wl += len(fb_final)
+            elif s.strict_empty_round_allowed:
+                logger.info("Fallback: 无高质量候选, 本轮静默")
 
         self.filter.record_round_signal_count(n_push, n_wl)
         self._end(t0, n_push, n_wl)
@@ -430,10 +415,10 @@ class CryptoRadar:
 
     async def run_loop(self):
         s = self.settings
-        logger.info(f"🚀 V2.9.1 | {s.scoring_mode}")
+        logger.info(f"🚀 V3.0 | {s.scoring_mode}")
         await self.load_caches()
         await self.notifier.push_text(
-            f"🚀 <b>Crypto Radar V2.9.1</b>\n"
+            f"🚀 <b>Crypto Radar V3.0</b>\n"
             f"模式:{s.scoring_mode} 间隔:{s.scan_interval_seconds}s\n"
             f"源:{','.join(src.name for src in self.sources)}\n"
             f"价格校验:{'开' if s.enable_price_verification else '关'} "

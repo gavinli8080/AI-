@@ -81,13 +81,13 @@ class Settings:
     volume_ratio_extreme_threshold: float = 50.0
 
     push_scan_stats: bool = False
-    push_watchlist_on_empty_main: bool = True
-    empty_main_watchlist_count: int = 4
+    push_watchlist_on_empty_main: bool = False
+    empty_main_watchlist_count: int = 1
 
     whitelist: list[str] = field(default_factory=list)
     blacklist: list[str] = field(default_factory=list)
 
-    push_min_score: float = 50.0
+    push_min_score: float = 58.0
     grade_a_threshold: float = 75.0
     grade_b_threshold: float = 55.0
 
@@ -107,7 +107,7 @@ class Settings:
     main_require_positive_4h: bool = True
     main_max_24h_change: float = 18.0
     main_max_1h_change: float = 8.5
-    main_min_turnover_24h: float = 1_000_000
+    main_min_turnover_24h: float = 1_500_000
     main_min_turnover_1h: float = 120_000
     leverage_watchlist_only: bool = True
     leverage_allowlist: list[str] = field(default_factory=list)
@@ -127,48 +127,66 @@ class Settings:
     fake_breakout_5m_min: float = 3.0        # 5m涨>此值且4h<0→假突破降级
     tail_surge_24h_min: float = 10.0         # 24h>此值且4h<2%→尾段惩罚
 
-    # V2.9.1: 24h区间位置
-    high_position_reject_threshold: float = 0.92  # 区间位置>此值且非强突破→拒绝主推
-    high_position_demote_threshold: float = 0.85  # 区间位置>此值→降低评分
+    # V3.0: 24h区间位置硬门槛
+    main_max_position: float = 0.62          # 主推最高允许24h区间位置
+    high_position_reject_threshold: float = 0.92  # 评分惩罚:区间>此→重罚
+    high_position_demote_threshold: float = 0.85  # 评分惩罚:区间>此→轻罚
+    fallback_max_position: float = 0.55      # fallback最高允许位置
+    watchlist_max_position: float = 0.68     # 观察池最高允许位置
+    low_position_repair_bonus: bool = True   # 低位启动加分
+    high_position_bounce_penalty: bool = True  # 高位反抽强惩罚
 
-    # V2.9.1: 弱修复/死猫跳过滤
-    weak_repair_max_1h: float = 2.0    # 24h<0 且 1h<此值→弱修复
-    weak_repair_max_4h: float = 1.5    # 24h<0 且 4h<此值→弱修复
-    weak_repair_min_vr5m: float = 1.8  # 弱修复但量比<此值→无量修复
+    # V3.0: 慢修复/弱修复/死猫跳 — 三级判定
+    weak_repair_max_1h: float = 2.0    # 弱修复: 24h<0 且 1h<此值
+    weak_repair_max_4h: float = 1.5    # 弱修复: 24h<0 且 4h<此值
+    weak_repair_min_vr5m: float = 1.8  # 无量修复: 量比<此值
+    slow_repair_min_1h: float = 3.0    # 慢修复: 24h<0 且 1h<此值(更宽)
+    slow_repair_min_4h: float = 4.0    # 慢修复: 24h<0 且 4h<此值(更宽)
+    slow_repair_min_turnover_1h: float = 100_000  # 慢修复: 1h额<此值
 
-    # V2.9.1: 观察池收紧
-    watchlist_min_score_strict: float = 35.0   # 严格观察池最低分(替代28)
-    watchlist_require_positive_1h: bool = True  # 观察池也要求1h>0
-    max_daily_watchlist_strict: int = 8        # 每日观察池上限收紧
+    # V3.0: 观察池 = 监控池,不是备选池
+    watchlist_min_score_strict: float = 40.0   # 严格观察池最低分
+    watchlist_require_positive_1h: bool = True
+    max_daily_watchlist_strict: int = 3        # 每日观察池上限
+    watchlist_min_turnover_24h: float = 500_000
+    watchlist_reject_slow_repair: bool = True
+    watchlist_reject_no_volume_repair: bool = True
+    watchlist_reject_high_position_bounce: bool = True
+    watchlist_require_real_continuation: bool = True  # 24h转正但1h/4h弱→不收
 
-    # V2.9.1: 大盘环境
+    # V3.0: 大盘环境 (4级: bullish/neutral/weak_neutral/bearish)
     market_regime_enabled: bool = True
-    market_regime_bearish_push_min_score: float = 65.0  # 大盘弱时主推最低分提高
-    market_regime_bearish_wl_min_score: float = 45.0    # 大盘弱时观察池最低分提高
+    market_regime_bearish_push_min_score: float = 70.0
+    market_regime_bearish_wl_min_score: float = 50.0
+    bearish_disable_small_cap_main: bool = True    # bearish时小所小币不进主推
+    bearish_disable_fallback: bool = True          # bearish时关闭fallback
+    bearish_strict_watchlist: bool = True           # bearish时观察池大幅收紧
+    weak_neutral_strict_main: bool = True           # weak_neutral时只允许高流动性主推
+    weak_neutral_strict_watchlist: bool = True      # weak_neutral时观察池收紧
+    weak_neutral_min_turnover_24h: float = 2_000_000  # weak_neutral主推最低24h额
 
-    # V2.9.1: 唯一一单模式
-    single_best_mode: bool = True       # 每轮主推最多保留N个
-    single_best_max_push: int = 1       # 最多推几个主推 (V2.9.2: 1)
-    single_best_min_score: float = 58.0 # 主推最低可接受分数 (V2.9.2: 58)
-    single_best_confidence_gap: float = 8.0  # V2.9.2: top1和top2差距<此值→不够确定,不推
-    single_best_weak_threshold: float = 62.0 # V2.9.2: top1低于此值视为"勉强可做",不推
+    # V3.0: 唯一一单模式
+    single_best_mode: bool = True
+    single_best_max_push: int = 1
+    single_best_min_score: float = 60.0    # 低于此分不推
+    single_best_min_edge: float = 6.0      # top1和top2差距<此→不够确定
+    single_best_require_clear_win: bool = True  # 要求明确优胜才推
 
-    # V2.9.1: 量比一致性
-    vol_ratio_inconsistency_penalty: bool = True  # 5m高但15m/1h不跟→额外惩罚
+    # V3.0: 量比一致性 + 纯脉冲
+    vol_ratio_inconsistency_penalty: bool = True
+    pure_15m_pulse_reject: bool = True     # 15m暴涨但1h/4h不跟→拒绝
 
-    # V2.9.2: 允许空轮 — 主推和观察池都不够时整轮静默
+    # V3.0: 允许空轮
     strict_empty_round_allowed: bool = True
-    # V2.9.2: fallback最低分门槛
-    fallback_min_score: float = 42.0
-    fallback_min_turnover_24h: float = 800_000
 
-    # V2.9.2: 大盘bearish时小所降级
-    market_regime_bearish_demote_minor_sources: bool = True  # bearish时gate/bybit/dex小币降级
-    market_regime_neutral_min_turnover_24h: float = 1_500_000  # neutral时主推最低24h额
-
-    # V2.9.2: 观察池更少更精
-    max_daily_watchlist_strict: int = 5        # V2.9.2: 5条
-    watchlist_min_turnover_24h: float = 500_000  # 观察池最低24h额
+    # V3.0: fallback (几乎不用)
+    fallback_min_score: float = 58.0
+    fallback_min_turnover_24h: float = 1_500_000
+    fallback_min_turnover_1h: float = 120_000
+    fallback_max_24h_change: float = 18.0
+    fallback_reject_slow_repair: bool = True
+    fallback_reject_high_position: bool = True
+    fallback_reject_small_exchange: bool = True  # fallback不收小所小币
 
 
 def load_settings() -> Settings:
@@ -210,11 +228,11 @@ def load_settings() -> Settings:
     s.volume_ratio_heavy_threshold = _ef("VOL_RATIO_HEAVY",20.0)
     s.volume_ratio_reject_threshold = _ef("VOL_RATIO_REJECT",35.0)
     s.volume_ratio_extreme_threshold = _ef("VOL_RATIO_EXTREME",50.0)
-    s.push_watchlist_on_empty_main = _eb("PUSH_WATCHLIST_ON_EMPTY",True)
-    s.empty_main_watchlist_count = _ei("EMPTY_MAIN_WL_COUNT",4)
+    s.push_watchlist_on_empty_main = _eb("PUSH_WATCHLIST_ON_EMPTY",False)
+    s.empty_main_watchlist_count = _ei("EMPTY_MAIN_WL_COUNT",1)
     s.whitelist = _el("WHITELIST","BTC,ETH,TAO,RNDR,NEAR,FET,VIRTUAL,AIXBT")
     s.blacklist = _el("BLACKLIST")
-    s.push_min_score = _ef("PUSH_MIN_SCORE",50.0)
+    s.push_min_score = _ef("PUSH_MIN_SCORE",58.0)
     s.db_path = _e("DB_PATH","data/radar.db")
     s.log_level = _e("LOG_LEVEL","INFO")
     s.log_file = _e("LOG_FILE","data/radar.log")
@@ -228,7 +246,7 @@ def load_settings() -> Settings:
     s.main_require_positive_4h = _eb("MAIN_REQUIRE_POSITIVE_4H",True)
     s.main_max_24h_change = _ef("MAIN_MAX_24H_CHANGE",18.0)
     s.main_max_1h_change = _ef("MAIN_MAX_1H_CHANGE",8.5)
-    s.main_min_turnover_24h = _ef("MAIN_MIN_TURNOVER_24H",1_000_000)
+    s.main_min_turnover_24h = _ef("MAIN_MIN_TURNOVER_24H",1_500_000)
     s.main_min_turnover_1h = _ef("MAIN_MIN_TURNOVER_1H",120_000)
     s.leverage_watchlist_only = _eb("LEVERAGE_WATCHLIST_ONLY",True)
     s.leverage_allowlist = [x.upper() for x in _el("LEVERAGE_ALLOWLIST")]
@@ -241,30 +259,51 @@ def load_settings() -> Settings:
     s.pulse_5m_1h_max = _ef("PULSE_5M_1H_MAX", 2.0)
     s.fake_breakout_5m_min = _ef("FAKE_BREAKOUT_5M_MIN", 3.0)
     s.tail_surge_24h_min = _ef("TAIL_SURGE_24H_MIN", 10.0)
-    # V2.9.1
+    # V3.0
+    s.main_max_position = _ef("MAIN_MAX_POSITION_IN_24H_RANGE", 0.62)
     s.high_position_reject_threshold = _ef("HIGH_POSITION_REJECT_THRESHOLD", 0.92)
     s.high_position_demote_threshold = _ef("HIGH_POSITION_DEMOTE_THRESHOLD", 0.85)
+    s.fallback_max_position = _ef("FALLBACK_MAX_POSITION_IN_24H_RANGE", 0.55)
+    s.watchlist_max_position = _ef("WATCHLIST_MAX_POSITION_IN_24H_RANGE", 0.68)
+    s.low_position_repair_bonus = _eb("LOW_POSITION_REPAIR_BONUS_ENABLED", True)
+    s.high_position_bounce_penalty = _eb("HIGH_POSITION_BOUNCE_PENALTY_ENABLED", True)
     s.weak_repair_max_1h = _ef("WEAK_REPAIR_MAX_1H", 2.0)
     s.weak_repair_max_4h = _ef("WEAK_REPAIR_MAX_4H", 1.5)
     s.weak_repair_min_vr5m = _ef("WEAK_REPAIR_MIN_VR5M", 1.8)
-    s.watchlist_min_score_strict = _ef("WATCHLIST_MIN_SCORE_STRICT", 35.0)
+    s.slow_repair_min_1h = _ef("SLOW_REPAIR_MIN_1H_CHANGE", 3.0)
+    s.slow_repair_min_4h = _ef("SLOW_REPAIR_MIN_4H_CHANGE", 4.0)
+    s.slow_repair_min_turnover_1h = _ef("SLOW_REPAIR_MIN_TURNOVER_1H", 100_000)
+    s.watchlist_min_score_strict = _ef("WATCHLIST_MIN_SCORE_STRICT", 40.0)
     s.watchlist_require_positive_1h = _eb("WATCHLIST_REQUIRE_POSITIVE_1H", True)
-    s.max_daily_watchlist_strict = _ei("MAX_DAILY_WATCHLIST_STRICT", 8)
-    s.market_regime_enabled = _eb("MARKET_REGIME_ENABLED", True)
-    s.market_regime_bearish_push_min_score = _ef("MARKET_REGIME_BEARISH_PUSH_MIN_SCORE", 65.0)
-    s.market_regime_bearish_wl_min_score = _ef("MARKET_REGIME_BEARISH_WL_MIN_SCORE", 45.0)
-    s.single_best_mode = _eb("SINGLE_BEST_MODE", True)
-    s.single_best_max_push = _ei("SINGLE_BEST_MAX_PUSH", 2)
-    s.single_best_min_score = _ef("SINGLE_BEST_MIN_SCORE", 55.0)
-    s.vol_ratio_inconsistency_penalty = _eb("VOL_RATIO_INCONSISTENCY_PENALTY", True)
-    s.wl_recheck_max_deviation_pct = _ef("WL_RECHECK_MAX_DEVIATION_PCT", 2.5)
-    # V2.9.2
-    s.single_best_confidence_gap = _ef("SINGLE_BEST_CONFIDENCE_GAP", 8.0)
-    s.single_best_weak_threshold = _ef("SINGLE_BEST_WEAK_THRESHOLD", 62.0)
-    s.strict_empty_round_allowed = _eb("STRICT_EMPTY_ROUND_ALLOWED", True)
-    s.fallback_min_score = _ef("FALLBACK_MIN_SCORE", 42.0)
-    s.fallback_min_turnover_24h = _ef("FALLBACK_MIN_TURNOVER_24H", 800_000)
-    s.market_regime_bearish_demote_minor_sources = _eb("MARKET_REGIME_BEARISH_DEMOTE_MINOR_SOURCES", True)
-    s.market_regime_neutral_min_turnover_24h = _ef("MARKET_REGIME_NEUTRAL_MIN_TURNOVER_24H", 1_500_000)
+    s.max_daily_watchlist_strict = _ei("MAX_DAILY_WATCHLIST_STRICT", 3)
     s.watchlist_min_turnover_24h = _ef("WATCHLIST_MIN_TURNOVER_24H", 500_000)
+    s.watchlist_reject_slow_repair = _eb("WATCHLIST_REJECT_SLOW_REPAIR", True)
+    s.watchlist_reject_no_volume_repair = _eb("WATCHLIST_REJECT_NO_VOLUME_REPAIR", True)
+    s.watchlist_reject_high_position_bounce = _eb("WATCHLIST_REJECT_HIGH_POSITION_BOUNCE", True)
+    s.watchlist_require_real_continuation = _eb("WATCHLIST_REQUIRE_REAL_CONTINUATION", True)
+    s.market_regime_enabled = _eb("MARKET_REGIME_ENABLED", True)
+    s.market_regime_bearish_push_min_score = _ef("MARKET_REGIME_BEARISH_PUSH_MIN_SCORE", 70.0)
+    s.market_regime_bearish_wl_min_score = _ef("MARKET_REGIME_BEARISH_WL_MIN_SCORE", 50.0)
+    s.bearish_disable_small_cap_main = _eb("BEARISH_DISABLE_SMALL_CAP_MAIN", True)
+    s.bearish_disable_fallback = _eb("BEARISH_DISABLE_FALLBACK", True)
+    s.bearish_strict_watchlist = _eb("BEARISH_STRICT_WATCHLIST", True)
+    s.weak_neutral_strict_main = _eb("WEAK_NEUTRAL_STRICT_MAIN", True)
+    s.weak_neutral_strict_watchlist = _eb("WEAK_NEUTRAL_STRICT_WATCHLIST", True)
+    s.weak_neutral_min_turnover_24h = _ef("WEAK_NEUTRAL_MIN_TURNOVER_24H", 2_000_000)
+    s.single_best_mode = _eb("SINGLE_BEST_MODE", True)
+    s.single_best_max_push = _ei("SINGLE_BEST_MAX_PUSH", 1)
+    s.single_best_min_score = _ef("SINGLE_BEST_MIN_SCORE", 60.0)
+    s.single_best_min_edge = _ef("SINGLE_BEST_MIN_EDGE", 6.0)
+    s.single_best_require_clear_win = _eb("SINGLE_BEST_REQUIRE_CLEAR_WIN", True)
+    s.vol_ratio_inconsistency_penalty = _eb("VOL_RATIO_INCONSISTENCY_PENALTY", True)
+    s.pure_15m_pulse_reject = _eb("PURE_15M_PULSE_REJECT_MAIN", True)
+    s.wl_recheck_max_deviation_pct = _ef("WL_RECHECK_MAX_DEVIATION_PCT", 2.5)
+    s.strict_empty_round_allowed = _eb("STRICT_EMPTY_ROUND_ALLOWED", True)
+    s.fallback_min_score = _ef("FALLBACK_MIN_SCORE", 58.0)
+    s.fallback_min_turnover_24h = _ef("FALLBACK_MIN_TURNOVER_24H", 1_500_000)
+    s.fallback_min_turnover_1h = _ef("FALLBACK_MIN_TURNOVER_1H", 120_000)
+    s.fallback_max_24h_change = _ef("FALLBACK_MAX_24H_CHANGE", 18.0)
+    s.fallback_reject_slow_repair = _eb("FALLBACK_REJECT_SLOW_REPAIR", True)
+    s.fallback_reject_high_position = _eb("FALLBACK_REJECT_HIGH_POSITION", True)
+    s.fallback_reject_small_exchange = _eb("FALLBACK_REJECT_SMALL_EXCHANGE_NOISE", True)
     return s
