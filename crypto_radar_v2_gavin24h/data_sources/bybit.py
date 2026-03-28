@@ -86,7 +86,9 @@ class BybitSource(BaseDataSource):
 
             md = MarketData(
                 symbol=normalized, source=self.name, price=price, timestamp=time.time(),
-                periods=MultiPeriodData(change_24h=change_24h, volume_24h=vol_24h, turnover_24h=turnover_24h),
+                periods=MultiPeriodData(change_24h=change_24h, volume_24h=vol_24h, turnover_24h=turnover_24h,
+                    high_24h=high_24h, low_24h=low_24h,
+                    position_in_24h_range=round(((price-low_24h)/(high_24h-low_24h)) if high_24h>low_24h>0 else 0.5, 3)),
                 liquidity=LiquidityData(), volatility_24h=volatility,
                 trade_url=self.get_validated_trade_url(normalized),
             )

@@ -86,11 +86,14 @@ class BinanceSource(BaseDataSource):
             trades_24h = int(item.get("count", 0))
             volatility = ((high_24h - low_24h) / low_24h * 100) if low_24h > 0 else 0.0
 
+            pos = ((price - low_24h) / (high_24h - low_24h)) if high_24h > low_24h > 0 else 0.5
             md = MarketData(
                 symbol=normalized, source=self.name, price=price, timestamp=time.time(),
                 periods=MultiPeriodData(
                     change_24h=change_24h, volume_24h=vol_24h,
                     turnover_24h=quote_vol_24h, trades_24h=trades_24h,
+                    high_24h=high_24h, low_24h=low_24h,
+                    position_in_24h_range=round(pos, 3),
                 ),
                 liquidity=LiquidityData(), volatility_24h=volatility,
                 trade_url=self.get_validated_trade_url(normalized),

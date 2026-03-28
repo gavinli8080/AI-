@@ -1,6 +1,7 @@
 """
-Crypto Radar V2 - 信号过滤器 (V2.8)
+Crypto Radar V2 - 信号过滤器 (V2.9.1)
 cooldown key=symbol:source, 多因子fallback排序, 多周期量比联合判断
+V2.9.1: 弱修复过滤, 24h高位过滤, 收紧观察池/fallback, market regime, single-best
 """
 from __future__ import annotations
 import time
@@ -110,6 +111,8 @@ class SignalFilter:
         self._thr_logged: bool = False
         self._recent_counts: deque[int] = deque(maxlen=settings.adaptive_lookback_cycles)
         self._adaptive: bool = False
+        # V2.9.1: 大盘环境
+        self._market_regime: str = "neutral"  # "bullish" / "neutral" / "bearish"
 
     def new_round(self, total: int) -> RejectionStats:
         self._stats = RejectionStats(total_input=total)
@@ -125,6 +128,15 @@ class SignalFilter:
     def stats(self) -> RejectionStats: return self._stats
     @property
     def is_adaptive(self) -> bool: return self._adaptive
+    @property
+    def market_regime(self) -> str: return self._market_regime
+
+    def set_market_regime(self, regime: str):
+        """由 main.py 每轮扫描开始时根据 BTC/ETH 状态设置"""
+        old = self._market_regime
+        self._market_regime = regime
+        if regime != old:
+            logger.info(f"MarketRegime: {old} → {regime}")
 
     def _check_adaptive(self):
         s = self.settings
@@ -373,6 +385,26 @@ class SignalFilter:
         if p.change_24h > s.tail_surge_24h_min and p.change_4h < 2.0:
             self._stats.post_rej["尾段过热"] += 1; return False, f"24h尾段无延续(24h={p.change_24h:.1f}% 4h={p.change_4h:.1f}%)"
 
+        # V2.9.1: 弱修复/死猫跳 — 24h跌+1h微涨+量比不足=无力反弹
+        if (0 < p.change_1h <= s.weak_repair_max_1h
+            and p.change_4h < s.weak_repair_max_4h
+            and p.volume_ratio_5m < s.weak_repair_min_vr5m
+            and p.change_24h < 0):
+            self._stats.post_rej["弱修复"] += 1
+            return False, f"弱修复(1h={p.change_1h:.1f}% 4h={p.change_4h:.1f}% vr={p.volume_ratio_5m:.1f}x 24h={p.change_24h:.1f}%)"
+
+        # V2.9.1: 24h区间高位 — 价格接近24h最高点,上方空间不足
+        pos = getattr(p, 'position_in_24h_range', 0.5)
+        if pos >= s.high_position_reject_threshold:
+            self._stats.post_rej["高位拒绝"] += 1
+            return False, f"24h区间顶部({pos:.0%})"
+
+        # V2.9.1: 大盘环境加分门槛 — bearish时主推需更高分
+        if s.market_regime_enabled and self._market_regime == "bearish":
+            if signal.score.total_score < s.market_regime_bearish_push_min_score:
+                self._stats.post_rej["大盘弱"] += 1
+                return False, f"大盘bearish需{s.market_regime_bearish_push_min_score:.0f}分(当前{signal.score.total_score:.0f})"
+
         ok, r = self.check_main_cooldown(signal)
         if not ok: self._stats.post_rej["cd"]+=1; return False,r
         self._ensure_daily()
@@ -386,42 +418,88 @@ class SignalFilter:
     def is_watchlist_candidate(self, signal: Signal) -> bool:
         """调用方必须已确保 signal 通过合法性校验"""
         s = self.settings
-        wl_min = s.watchlist_min_score
-        if self._adaptive: wl_min = max(wl_min - s.adaptive_watchlist_score_relax, 15)
+        # V2.9.1: 使用更严格的观察池最低分
+        wl_min = max(s.watchlist_min_score, s.watchlist_min_score_strict)
+        if self._adaptive: wl_min = max(wl_min - s.adaptive_watchlist_score_relax, 20)
         if signal.phase == SignalPhase.REJECT: return False
         if signal.score.total_score < wl_min: return False
         p = signal.market_data.periods
+
+        # V2.9.1: 观察池也要求1h>0
+        if s.watchlist_require_positive_1h and p.change_1h <= 0:
+            return False
+
         if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist:
             if p.change_1h <= 0 or p.change_4h <= 0:
                 return False
         if p.change_24h > s.watchlist_reject_if_24h_overheat:
             return False
+
+        # V2.9.1: 弱修复也不进观察池
+        if (0 < p.change_1h <= s.weak_repair_max_1h
+            and p.change_4h < s.weak_repair_max_4h
+            and p.volume_ratio_5m < s.weak_repair_min_vr5m
+            and p.change_24h < 0):
+            return False
+
+        # V2.9.1: 24h高位也不进观察池
+        pos = getattr(p, 'position_in_24h_range', 0.5)
+        if pos >= s.high_position_demote_threshold:
+            return False
+
+        # V2.9.1: 大盘弱时观察池门槛更高
+        if s.market_regime_enabled and self._market_regime == "bearish":
+            if signal.score.total_score < s.market_regime_bearish_wl_min_score:
+                return False
+
         ok, _ = self.check_watchlist_cooldown(signal)
         if not ok: return False
         self._ensure_daily()
-        return self._daily_wl < s.max_daily_watchlist
+        # V2.9.1: 使用更严格的每日观察池上限
+        max_wl = min(s.max_daily_watchlist, s.max_daily_watchlist_strict)
+        return self._daily_wl < max_wl
 
     # =================== Fallback 排序 ===================
     @staticmethod
     def rank_for_fallback(signals: list[Signal]) -> list[Signal]:
-        """多因子排序: 适合24h > 结构协调 > 非脉冲 > 分数"""
+        """V2.9.1: 多因子排序+更严入池条件: 适合24h > 结构协调 > 非脉冲 > 低位 > 分数"""
         def _key(sig: Signal) -> tuple:
             p = sig.market_data.periods
             adv = sig.advice
-            # 因子1: 适合24h短线 (bool → int)
             f1 = 1 if adv.is_suitable_for_24h_trade else 0
-            # 因子2: 1h/4h协调 (bool)
             f2 = 1 if (2 < p.change_1h < 15 and 1 < p.change_4h < 20 and p.change_24h < 30) else 0
-            # 因子3: 非纯脉冲 (bool)
             f3 = 1 if not (p.change_5m > 5 and p.change_15m < 1.5) else 0
-            # 因子4: 24h不过热 (bool)
             f4 = 1 if p.change_24h < 25 else 0
-            # 因子5: 流动性足够 (bool)
             f5 = 1 if p.turnover_24h > 500_000 else 0
-            # 因子6: 总分
-            f6 = sig.score.total_score
-            return (f1, f2, f3, f4, f5, f6)
+            # V2.9.1: 24h区间位置 — 低位优先
+            pos = getattr(p, 'position_in_24h_range', 0.5)
+            f6 = 1 if pos < 0.7 else 0
+            f7 = sig.score.total_score
+            return (f1, f2, f3, f4, f5, f6, f7)
         return sorted(signals, key=_key, reverse=True)
+
+    def filter_fallback_pool(self, signals: list[Signal]) -> list[Signal]:
+        """V2.9.1: fallback也要过最低健康标准,拒绝弱修复/高位/纯脉冲"""
+        s = self.settings
+        result = []
+        for sig in signals:
+            p = sig.market_data.periods
+            if sig.phase == SignalPhase.REJECT: continue
+            if sig.score.total_score <= 25: continue
+            # 1h必须为正
+            if p.change_1h <= 0: continue
+            # 弱修复不进fallback
+            if (0 < p.change_1h <= s.weak_repair_max_1h
+                and p.change_4h < s.weak_repair_max_4h
+                and p.volume_ratio_5m < s.weak_repair_min_vr5m
+                and p.change_24h < 0): continue
+            # 24h高位不进fallback
+            pos = getattr(p, 'position_in_24h_range', 0.5)
+            if pos >= s.high_position_demote_threshold: continue
+            # 纯5m脉冲不进fallback
+            if p.change_5m > s.pulse_5m_change_threshold and p.change_1h < s.pulse_5m_1h_max: continue
+            result.append(sig)
+        return result
 
     # =================== 跨交易所去重 (V2.9) ===================
     def cross_exchange_dedup(self, signals: list[Signal]) -> tuple[list[Signal], list[Signal]]:

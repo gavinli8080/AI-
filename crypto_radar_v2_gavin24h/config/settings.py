@@ -115,7 +115,8 @@ class Settings:
 
     # V2.9: 推送前复核
     recheck_enabled: bool = True
-    recheck_max_deviation_pct: float = 3.0   # 复核偏差超此值→降级观察池
+    recheck_max_deviation_pct: float = 3.0   # 主推复核偏差超此值→降级
+    wl_recheck_max_deviation_pct: float = 2.5  # 观察池复核偏差超此值→丢弃
 
     # V2.9: 跨交易所去重
     cross_exchange_dedup_enabled: bool = True
@@ -124,7 +125,34 @@ class Settings:
     pulse_5m_change_threshold: float = 5.0   # 5m涨>此值且1h<2%→纯脉冲拒绝
     pulse_5m_1h_max: float = 2.0
     fake_breakout_5m_min: float = 3.0        # 5m涨>此值且4h<0→假突破降级
-    tail_surge_24h_min: float = 10.0         # 24h>此值且(24h-4h)<3%→尾段惩罚
+    tail_surge_24h_min: float = 10.0         # 24h>此值且4h<2%→尾段惩罚
+
+    # V2.9.1: 24h区间位置
+    high_position_reject_threshold: float = 0.92  # 区间位置>此值且非强突破→拒绝主推
+    high_position_demote_threshold: float = 0.85  # 区间位置>此值→降低评分
+
+    # V2.9.1: 弱修复/死猫跳过滤
+    weak_repair_max_1h: float = 2.0    # 24h<0 且 1h<此值→弱修复
+    weak_repair_max_4h: float = 1.5    # 24h<0 且 4h<此值→弱修复
+    weak_repair_min_vr5m: float = 1.8  # 弱修复但量比<此值→无量修复
+
+    # V2.9.1: 观察池收紧
+    watchlist_min_score_strict: float = 35.0   # 严格观察池最低分(替代28)
+    watchlist_require_positive_1h: bool = True  # 观察池也要求1h>0
+    max_daily_watchlist_strict: int = 8        # 每日观察池上限收紧
+
+    # V2.9.1: 大盘环境
+    market_regime_enabled: bool = True
+    market_regime_bearish_push_min_score: float = 65.0  # 大盘弱时主推最低分提高
+    market_regime_bearish_wl_min_score: float = 45.0    # 大盘弱时观察池最低分提高
+
+    # V2.9.1: 唯一一单模式
+    single_best_mode: bool = True       # 每轮主推最多保留N个
+    single_best_max_push: int = 2       # 最多推几个主推
+    single_best_min_score: float = 55.0 # 主推最低可接受分数(低于此不推)
+
+    # V2.9.1: 量比一致性
+    vol_ratio_inconsistency_penalty: bool = True  # 5m高但15m/1h不跟→额外惩罚
 
 
 def load_settings() -> Settings:
@@ -197,4 +225,21 @@ def load_settings() -> Settings:
     s.pulse_5m_1h_max = _ef("PULSE_5M_1H_MAX", 2.0)
     s.fake_breakout_5m_min = _ef("FAKE_BREAKOUT_5M_MIN", 3.0)
     s.tail_surge_24h_min = _ef("TAIL_SURGE_24H_MIN", 10.0)
+    # V2.9.1
+    s.high_position_reject_threshold = _ef("HIGH_POSITION_REJECT_THRESHOLD", 0.92)
+    s.high_position_demote_threshold = _ef("HIGH_POSITION_DEMOTE_THRESHOLD", 0.85)
+    s.weak_repair_max_1h = _ef("WEAK_REPAIR_MAX_1H", 2.0)
+    s.weak_repair_max_4h = _ef("WEAK_REPAIR_MAX_4H", 1.5)
+    s.weak_repair_min_vr5m = _ef("WEAK_REPAIR_MIN_VR5M", 1.8)
+    s.watchlist_min_score_strict = _ef("WATCHLIST_MIN_SCORE_STRICT", 35.0)
+    s.watchlist_require_positive_1h = _eb("WATCHLIST_REQUIRE_POSITIVE_1H", True)
+    s.max_daily_watchlist_strict = _ei("MAX_DAILY_WATCHLIST_STRICT", 8)
+    s.market_regime_enabled = _eb("MARKET_REGIME_ENABLED", True)
+    s.market_regime_bearish_push_min_score = _ef("MARKET_REGIME_BEARISH_PUSH_MIN_SCORE", 65.0)
+    s.market_regime_bearish_wl_min_score = _ef("MARKET_REGIME_BEARISH_WL_MIN_SCORE", 45.0)
+    s.single_best_mode = _eb("SINGLE_BEST_MODE", True)
+    s.single_best_max_push = _ei("SINGLE_BEST_MAX_PUSH", 2)
+    s.single_best_min_score = _ef("SINGLE_BEST_MIN_SCORE", 55.0)
+    s.vol_ratio_inconsistency_penalty = _eb("VOL_RATIO_INCONSISTENCY_PENALTY", True)
+    s.wl_recheck_max_deviation_pct = _ef("WL_RECHECK_MAX_DEVIATION_PCT", 2.5)
     return s

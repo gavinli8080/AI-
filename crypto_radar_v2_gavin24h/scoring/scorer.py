@@ -1,6 +1,7 @@
 """
-Crypto Radar V2 - 评分引擎 (V2.8)
+Crypto Radar V2 - 评分引擎 (V2.9.1)
 尾段冲刺+纯脉冲惩罚强化, 24h结构偏好, 量比多周期联合
+V2.9.1: 24h区间位置因子, 弱修复惩罚, 量比不一致惩罚
 """
 from __future__ import annotations
 import hashlib, time, logging
@@ -152,6 +153,10 @@ class SignalScorer:
         # 1h/4h/24h协调加分
         if 2 < p.change_1h < 15 and 3 < p.change_4h < 20 and p.change_24h < 25:
             c+=3; sb.score_reasons.append("1h/4h/24h协调")
+        # V2.9.1: 24h区间位置加分 — 低位启动更有空间
+        pos = getattr(p, 'position_in_24h_range', 0.5)
+        if pos < 0.4:
+            c += 2; sb.score_reasons.append(f"低位启动({pos:.0%})")
         sb.continuation_score = min(c, 15)
 
         # 突破质量 0-10
@@ -175,6 +180,21 @@ class SignalScorer:
         ts_min = getattr(s, 'tail_surge_24h_min', 10.0)
         if p.change_24h > ts_min and p.change_4h < 2.0:
             oh += 4; sb.penalty_reasons.append(f"24h涨幅早期集中(4h仅{p.change_4h:.1f}%)")
+
+        # V2.9.1: 24h区间位置惩罚 — 价格接近24h高点,上方空间有限
+        pos = getattr(p, 'position_in_24h_range', 0.5)
+        if pos >= s.high_position_reject_threshold:
+            oh += 6; sb.penalty_reasons.append(f"24h区间顶部({pos:.0%})")
+        elif pos >= s.high_position_demote_threshold:
+            oh += 3; sb.penalty_reasons.append(f"24h区间偏高({pos:.0%})")
+
+        # V2.9.1: 弱修复/死猫跳惩罚 — 1h/4h涨幅微弱+量比不足=无力反弹
+        if (0 < p.change_1h <= s.weak_repair_max_1h
+            and p.change_4h < s.weak_repair_max_4h
+            and p.volume_ratio_5m < s.weak_repair_min_vr5m
+            and p.change_24h < 0):
+            oh += 4; sb.penalty_reasons.append(f"弱修复(1h={p.change_1h:.1f}% vr={p.volume_ratio_5m:.1f}x 24h={p.change_24h:.1f}%)")
+
         sb.overheat_penalty = min(oh, 20)
 
         # 操纵风险 0-10
@@ -198,6 +218,12 @@ class SignalScorer:
         # V2.8: 纯5m脉冲惩罚加强
         if p.change_5m > 5 and p.change_15m < 1.5 and p.change_1h < 3:
             mp+=3; sb.penalty_reasons.append("纯5m脉冲")
+
+        # V2.9.1: 量比不一致惩罚 — 5m量比高但15m/1h不跟随=单根异常
+        if s.vol_ratio_inconsistency_penalty:
+            if p.volume_ratio_5m > 5.0 and p.volume_ratio_15m < 1.5:
+                mp += 3; sb.penalty_reasons.append(f"量比不一致(5m={p.volume_ratio_5m:.0f}x 15m={p.volume_ratio_15m:.1f}x)")
+
         sb.manipulation_risk_penalty = min(mp, 10)
 
         # 链上风险 0-10

@@ -142,5 +142,104 @@ class TestCrossExchangeDedup(unittest.TestCase):
         self.assertEqual(len(kept), 2)
 
 
+class TestWeakRepairFilter(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings(scoring_mode="strict")
+        self.f = SignalFilter(self.settings)
+        self.f.new_round(100)
+
+    def test_weak_repair_rejected(self):
+        """24h跌+1h微涨+量比不足 → 弱修复拒绝"""
+        sig = _sig(score=55, change_5m=1.0, change_1h=1.5, change_4h=1.0,
+                   change_15m=1.5, change_24h=-5.0,
+                   turnover_24h=2_000_000, turnover_1h=200_000,
+                   volume_ratio_5m=1.2)
+        ok, reason = self.f.post_filter(sig)
+        self.assertFalse(ok)
+        self.assertIn("弱修复", reason)
+
+    def test_strong_repair_passes(self):
+        """24h跌但1h强涨+量比足 → 不是弱修复"""
+        sig = _sig(score=60, change_5m=3.0, change_1h=5.0, change_4h=3.0,
+                   change_15m=4.0, change_24h=-3.0,
+                   turnover_24h=2_000_000, turnover_1h=200_000,
+                   volume_ratio_5m=3.0)
+        ok, _ = self.f.post_filter(sig)
+        self.assertTrue(ok)
+
+
+class TestHighPositionFilter(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings(scoring_mode="strict")
+        self.f = SignalFilter(self.settings)
+        self.f.new_round(100)
+
+    def test_high_position_rejected(self):
+        """24h区间顶部(>92%) → 拒绝"""
+        sig = _sig(score=65, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                   change_15m=3.0, change_24h=8.0,
+                   turnover_24h=2_000_000, turnover_1h=200_000,
+                   volume_ratio_5m=2.5, position_in_24h_range=0.95,
+                   high_24h=1.1, low_24h=0.9)
+        ok, reason = self.f.post_filter(sig)
+        self.assertFalse(ok)
+        self.assertIn("顶部", reason)
+
+
+class TestMarketRegimeFilter(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings(scoring_mode="strict")
+        self.f = SignalFilter(self.settings)
+        self.f.new_round(100)
+
+    def test_bearish_regime_blocks_low_score(self):
+        """大盘bearish时,低分信号被阻挡"""
+        self.f.set_market_regime("bearish")
+        sig = _sig(score=58, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                   change_15m=3.0, change_24h=8.0,
+                   turnover_24h=2_000_000, turnover_1h=200_000,
+                   volume_ratio_5m=2.5)
+        ok, reason = self.f.post_filter(sig)
+        self.assertFalse(ok)
+        self.assertIn("bearish", reason)
+
+    def test_neutral_regime_allows_normal(self):
+        """大盘neutral时,正常分数通过"""
+        self.f.set_market_regime("neutral")
+        sig = _sig(score=60, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                   change_15m=3.0, change_24h=8.0,
+                   turnover_24h=2_000_000, turnover_1h=200_000,
+                   volume_ratio_5m=2.5)
+        ok, _ = self.f.post_filter(sig)
+        self.assertTrue(ok)
+
+
+class TestWatchlistTightened(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings(scoring_mode="strict")
+        self.f = SignalFilter(self.settings)
+        self.f.new_round(100)
+
+    def test_wl_rejects_negative_1h(self):
+        """V2.9.1: 观察池要求1h>0"""
+        sig = _sig(score=45, phase=SignalPhase.WATCH,
+                   change_5m=1.0, change_1h=-0.5, change_4h=2.0,
+                   change_15m=1.5, change_24h=5.0,
+                   turnover_24h=2_000_000, turnover_1h=200_000,
+                   volume_ratio_5m=2.0)
+        result = self.f.is_watchlist_candidate(sig)
+        self.assertFalse(result)
+
+    def test_wl_rejects_low_score(self):
+        """V2.9.1: 观察池最低分提高到35"""
+        sig = _sig(score=30, phase=SignalPhase.WATCH,
+                   change_5m=1.0, change_1h=2.0, change_4h=2.0,
+                   change_15m=1.5, change_24h=5.0,
+                   turnover_24h=2_000_000, turnover_1h=200_000,
+                   volume_ratio_5m=2.0)
+        result = self.f.is_watchlist_candidate(sig)
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()

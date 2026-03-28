@@ -125,6 +125,11 @@ class MultiPeriodData:
     trades_1h: int = 0
     trades_24h: int = 0
 
+    # V2.9.1: 24h区间位置
+    high_24h: float = 0.0
+    low_24h: float = 0.0
+    position_in_24h_range: float = 0.5  # (price-low)/(high-low), 0=底部 1=顶部
+
 
 @dataclass
 class LiquidityData:

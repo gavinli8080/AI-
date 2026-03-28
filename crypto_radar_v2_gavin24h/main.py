@@ -1,6 +1,7 @@
 """
-Crypto Radar V2 (V2.9)
+Crypto Radar V2 (V2.9.1.1)
 严格双流隔离, fallback仅从合法观察池选, 多因子fallback排序
+V2.9.1.1: market regime, single-best, watchlist recheck, tighter fallback
 """
 from __future__ import annotations
 import sys, os, asyncio, logging, time, argparse
@@ -57,6 +58,32 @@ class CryptoRadar:
             src = DexScreenerSource(s, HttpClient(timeout=s.http_timeout, proxy=s.proxy))
             self.sources.append(src); self.source_map["dexscreener"] = src; self.tracker.register_source("dexscreener", src)
 
+    def _detect_market_regime(self, all_md: list[MarketData]) -> str:
+        """V2.9.1.1: 根据 BTC/ETH 的 1h/4h 状态判断大盘环境"""
+        if not self.settings.market_regime_enabled:
+            return "neutral"
+        btc_md = None
+        eth_md = None
+        for md in all_md:
+            base = (md.symbol.split("/")[0] if "/" in md.symbol else md.symbol).upper()
+            if base == "BTC" and btc_md is None: btc_md = md
+            elif base == "ETH" and eth_md is None: eth_md = md
+            if btc_md and eth_md: break
+
+        bear_signals = 0
+        bull_signals = 0
+        for ref in [btc_md, eth_md]:
+            if ref is None: continue
+            p = ref.periods
+            if p.change_1h < -2: bear_signals += 1
+            elif p.change_1h > 1: bull_signals += 1
+            if p.change_4h < -3: bear_signals += 1
+            elif p.change_4h > 2: bull_signals += 1
+
+        if bear_signals >= 3: return "bearish"
+        if bull_signals >= 3: return "bullish"
+        return "neutral"
+
     async def load_caches(self):
         logger.info("Loading market caches...")
         for i, r in enumerate(await asyncio.gather(*(src.load_market_cache() for src in self.sources), return_exceptions=True)):
@@ -79,6 +106,9 @@ class CryptoRadar:
             if isinstance(r, list): all_md.extend(r)
             elif isinstance(r, Exception): logger.error(f"{self.sources[i].name}: {r}")
         logger.info(f"Tickers: {len(all_md)}")
+        # V2.9.1.1: 大盘环境检测
+        regime = self._detect_market_regime(all_md)
+        self.filter.set_market_regime(regime)
         rs = self.filter.new_round(len(all_md))
 
         # 2. Coarse
@@ -174,11 +204,26 @@ class CryptoRadar:
             if ok: pushed_cands.append(sig)
             else: main_overflow.append(sig)
 
-        # 10. Cross-exchange dedup (V2.9) — 同币多交易所只保留最优
+        # 10. Cross-exchange dedup (V2.9.1) — 同币多交易所只保留最优
         xd_kept, xd_demoted = self.filter.cross_exchange_dedup(pushed_cands)
 
-        # 主推溢出 + 跨交易所降级 合并到观察池 (已过合法性)
-        combined_wl = valid_wl + main_overflow + xd_demoted
+        # V2.9.1.1: Single-best ranking — 限制主推数量,溢出降入观察池
+        sb_overflow: list[Signal] = []
+        if s.single_best_mode and len(xd_kept) > s.single_best_max_push:
+            xd_kept.sort(key=lambda sig: sig.score.total_score, reverse=True)
+            # 低于 single_best_min_score 的直接溢出
+            real_kept: list[Signal] = []
+            for sig in xd_kept:
+                if len(real_kept) < s.single_best_max_push and sig.score.total_score >= s.single_best_min_score:
+                    real_kept.append(sig)
+                else:
+                    sb_overflow.append(sig)
+            xd_kept = real_kept
+            if sb_overflow:
+                logger.info(f"SingleBest: kept={len(xd_kept)} overflow={len(sb_overflow)}")
+
+        # 主推溢出 + 跨交易所降级 + single-best溢出 合并到观察池 (已过合法性)
+        combined_wl = valid_wl + main_overflow + xd_demoted + sb_overflow
         # 去重 + 冷却检查
         seen = set()
         final_wl: list[Signal] = []
@@ -199,7 +244,7 @@ class CryptoRadar:
         final_wl = final_wl[:s.max_daily_watchlist]
 
         # ============================================================
-        # 12. PRE-PUSH PRICE RECHECK (V2.9) — 推送前实时价格复核
+        # 12. PRE-PUSH PRICE RECHECK (V2.9.1) — 推送前实时价格复核
         # ============================================================
         recheck_passed: list[Signal] = []
         recheck_demoted: list[Signal] = []
@@ -246,6 +291,41 @@ class CryptoRadar:
         logger.info(f"Recheck: passed={len(recheck_passed)} demoted={len(recheck_demoted)}")
 
         # ============================================================
+        # 12b. WATCHLIST RECHECK (V2.9.1.1) — 观察池也做价格复核
+        # ============================================================
+        if s.recheck_enabled and final_wl:
+            wl_rc_sem = asyncio.Semaphore(5)
+            async def _wl_recheck(sig: Signal) -> Signal:
+                async with wl_rc_sem:
+                    src = self._resolve(sig.market_data)
+                    if not src: return sig
+                    try:
+                        klines = await src.fetch_klines(sig.symbol, "1m", 1)
+                        if klines:
+                            rc_price = klines[-1].get("close", 0)
+                            if rc_price > 0:
+                                dev = abs(rc_price - sig.price) / sig.price * 100
+                                sig.market_data.validation.recheck_price = rc_price
+                                sig.market_data.validation.recheck_deviation_pct = round(dev, 2)
+                                sig.market_data.validation.recheck_time = time.time()
+                    except Exception as e:
+                        logger.warning(f"WL Recheck failed {sig.symbol}: {e}")
+                    return sig
+
+            wl_rechecked = await asyncio.gather(*(_wl_recheck(sig) for sig in final_wl), return_exceptions=True)
+            wl_clean: list[Signal] = []
+            for r in wl_rechecked:
+                if isinstance(r, Exception): continue
+                sig = r
+                dev = sig.market_data.validation.recheck_deviation_pct
+                if dev > s.wl_recheck_max_deviation_pct and sig.market_data.validation.recheck_price > 0:
+                    logger.info(f"WL Recheck DROP {sig.symbol}: dev={dev:.1f}% > {s.wl_recheck_max_deviation_pct}%")
+                else:
+                    wl_clean.append(sig)
+            logger.info(f"WL Recheck: {len(final_wl)} → {len(wl_clean)}")
+            final_wl = wl_clean
+
+        # ============================================================
         # 13. PUSH 主推
         # ============================================================
         n_push = 0
@@ -271,9 +351,8 @@ class CryptoRadar:
         # 15. FALLBACK — 严格只从 valid_wl 选 (不混入 valid_main)
         # ============================================================
         if n_push == 0 and n_wl == 0 and s.push_watchlist_on_empty_main:
-            # 只用观察池流中已过合法性的信号 (valid_wl, 不含 main_overflow)
-            fb_pool = [sig for sig in valid_wl
-                       if sig.phase != SignalPhase.REJECT and sig.score.total_score > 25]
+            # V2.9.1.1: 只用观察池流中已过合法性的信号, 并过严格健康筛选
+            fb_pool = self.filter.filter_fallback_pool(valid_wl)
             # 多因子排序
             fb_ranked = self.filter.rank_for_fallback(fb_pool)
             # 去重
@@ -310,10 +389,10 @@ class CryptoRadar:
 
     async def run_loop(self):
         s = self.settings
-        logger.info(f"🚀 V2.9 | {s.scoring_mode}")
+        logger.info(f"🚀 V2.9.1 | {s.scoring_mode}")
         await self.load_caches()
         await self.notifier.push_text(
-            f"🚀 <b>Crypto Radar V2.9</b>\n"
+            f"🚀 <b>Crypto Radar V2.9.1</b>\n"
             f"模式:{s.scoring_mode} 间隔:{s.scan_interval_seconds}s\n"
             f"源:{','.join(src.name for src in self.sources)}\n"
             f"价格校验:{'开' if s.enable_price_verification else '关'} "

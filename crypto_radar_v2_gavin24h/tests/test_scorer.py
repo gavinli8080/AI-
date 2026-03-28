@@ -114,5 +114,72 @@ class TestTailSurgePenalty(unittest.TestCase):
         self.assertGreater(sig_early.score.overheat_penalty, sig_even.score.overheat_penalty)
 
 
+class TestPositionFactor(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings(scoring_mode="strict")
+        self.scorer = SignalScorer(self.settings)
+
+    def test_high_position_penalty(self):
+        """24h区间顶部(>92%)应被惩罚"""
+        md_high = _md(periods={"change_5m": 2.0, "change_15m": 3.0, "change_1h": 4.0,
+                                "change_4h": 5.0, "change_24h": 10.0,
+                                "volume_ratio_5m": 2.5, "turnover_24h": 2_000_000,
+                                "position_in_24h_range": 0.95, "high_24h": 1.1, "low_24h": 0.9})
+        md_low = _md(periods={"change_5m": 2.0, "change_15m": 3.0, "change_1h": 4.0,
+                               "change_4h": 5.0, "change_24h": 10.0,
+                               "volume_ratio_5m": 2.5, "turnover_24h": 2_000_000,
+                               "position_in_24h_range": 0.3, "high_24h": 1.5, "low_24h": 0.8})
+        sig_high = self.scorer.score(md_high)
+        sig_low = self.scorer.score(md_low)
+        self.assertGreater(sig_high.score.overheat_penalty, sig_low.score.overheat_penalty)
+
+    def test_low_position_bonus(self):
+        """低位启动(<40%)应在延续性获得加分"""
+        md_low = _md(periods={"change_5m": 2.0, "change_15m": 3.0, "change_1h": 4.0,
+                               "change_4h": 5.0, "change_24h": 10.0,
+                               "volume_ratio_5m": 2.5, "volume_ratio_15m": 1.5,
+                               "turnover_24h": 2_000_000,
+                               "position_in_24h_range": 0.25})
+        md_mid = _md(periods={"change_5m": 2.0, "change_15m": 3.0, "change_1h": 4.0,
+                               "change_4h": 5.0, "change_24h": 10.0,
+                               "volume_ratio_5m": 2.5, "volume_ratio_15m": 1.5,
+                               "turnover_24h": 2_000_000,
+                               "position_in_24h_range": 0.6})
+        sig_low = self.scorer.score(md_low)
+        sig_mid = self.scorer.score(md_mid)
+        self.assertGreaterEqual(sig_low.score.continuation_score, sig_mid.score.continuation_score)
+
+
+class TestWeakRepairPenalty(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings(scoring_mode="strict")
+        self.scorer = SignalScorer(self.settings)
+
+    def test_weak_repair_penalized(self):
+        """24h跌+1h微涨+量比不足 → 弱修复惩罚"""
+        md = _md(periods={"change_5m": 1.0, "change_15m": 1.5, "change_1h": 1.5,
+                          "change_4h": 1.0, "change_24h": -5.0,
+                          "volume_ratio_5m": 1.2, "turnover_24h": 2_000_000})
+        sig = self.scorer.score(md)
+        penalties = sig.score.penalty_reasons
+        self.assertTrue(any("弱修复" in r for r in penalties))
+
+
+class TestVolRatioInconsistency(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings(scoring_mode="strict")
+        self.scorer = SignalScorer(self.settings)
+
+    def test_inconsistent_vol_ratio_penalized(self):
+        """5m量比>5但15m<1.5 → 量比不一致惩罚"""
+        md = _md(periods={"change_5m": 3.0, "change_15m": 4.0, "change_1h": 6.0,
+                          "change_4h": 5.0, "change_24h": 10.0,
+                          "volume_ratio_5m": 8.0, "volume_ratio_15m": 1.2,
+                          "turnover_24h": 2_000_000})
+        sig = self.scorer.score(md)
+        penalties = sig.score.penalty_reasons
+        self.assertTrue(any("量比不一致" in r for r in penalties))
+
+
 if __name__ == "__main__":
     unittest.main()
