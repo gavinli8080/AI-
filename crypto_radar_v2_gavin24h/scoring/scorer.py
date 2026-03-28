@@ -290,7 +290,7 @@ class SignalScorer:
             and p.volume_ratio_5m < s.volume_ratio_heavy_threshold
             and p.change_1h > 0 and p.change_4h > 0
             and p.change_1h < s.main_max_1h_change and p.change_24h < s.main_max_24h_change
-            and (not is_leverage or not s.leverage_watchlist_only)
+            and (not is_leverage or not getattr(s, 'leverage_token_full_block', True))
         )
 
         if phase == SignalPhase.REJECT:
