@@ -213,15 +213,10 @@ class SignalFilter:
         if not hit and p.volume_ratio_5m > 3 and p.change_5m > e5*0.6: hit = True
         if not hit and wl and p.change_1h > e15: hit = True
 
-        if is_leverage and not wl and s.leverage_watchlist_only:
-            self._stats.fine_rej["杠杆主推禁用"] += 1
-            return False, "杠杆代币仅观察池"
-
-        if is_leverage and wl:
-            # 杠杆代币进入观察池也更严格
-            if p.change_1h <= 0 or p.change_4h <= 0 or p.change_24h > s.watchlist_reject_if_24h_overheat:
-                self._stats.fine_rej["杠杆观察过热"] += 1
-                return False, "杠杆结构不足"
+        # V3.1.1: 杠杆代币全局禁推 — 主推和观察池都直接拒绝
+        if is_leverage and s.leverage_token_full_block:
+            self._stats.fine_rej["杠杆禁推"] += 1
+            return False, "杠杆代币全局禁推"
 
         if not hit:
             tag = "涨幅" if not wl else "WL涨幅"
@@ -359,12 +354,10 @@ class SignalFilter:
         sk = _src_key(signal.source)
         is_dex = sk in ("dex", "dexscreener")
 
-        # V3.1: 杠杆代币全局禁推
+        # V3.1.1: 杠杆代币全局禁推
         if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist:
-            if s.leverage_token_full_block or s.leverage_token_push_disabled:
+            if s.leverage_token_full_block:
                 self._stats.post_rej["杠杆禁推"] += 1; return False, "杠杆代币全局禁推"
-            if s.leverage_watchlist_only:
-                self._stats.post_rej["杠杆"] += 1; return False, "杠杆代币主推禁用"
 
         # V3.1: DEX禁推
         if is_dex and s.dex_push_disabled:
@@ -469,9 +462,9 @@ class SignalFilter:
         sk = _src_key(signal.source)
         is_dex = sk in ("dex", "dexscreener")
 
-        # V3.1: 杠杆代币全局禁止进观察池
+        # V3.1.1: 杠杆代币全局禁止进观察池
         if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist:
-            if s.leverage_token_full_block or s.leverage_token_watchlist_disabled:
+            if s.leverage_token_full_block:
                 return False
         # V3.1: DEX禁止进观察池
         if is_dex and s.dex_watchlist_disabled: return False
@@ -567,9 +560,9 @@ class SignalFilter:
             is_dex = sk in ("dex", "dexscreener")
             if sig.phase == SignalPhase.REJECT: continue
             if sig.score.total_score < s.fallback_min_score: continue
-            # V3.1: 杠杆/DEX/非CEX全部禁止进fallback
+            # V3.1.1: 杠杆/DEX/非CEX全部禁止进fallback
             if _is_leverage_symbol(sig.symbol) and _base_symbol(sig.symbol) not in s.leverage_allowlist:
-                if s.leverage_token_full_block or s.leverage_token_fallback_disabled: continue
+                if s.leverage_token_full_block: continue
             if is_dex and s.dex_fallback_disabled: continue
             if getattr(s, 'fallback_require_cex_only', True) and sk not in CEX_SOURCE_NAMES: continue
             if p.turnover_24h > 0 and p.turnover_24h < s.fallback_min_turnover_24h: continue

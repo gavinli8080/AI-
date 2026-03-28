@@ -91,35 +91,58 @@ class CryptoRadar:
         return "neutral"
 
     def _detect_day_strength(self, regime: str, candidates: list[Signal]) -> str:
-        """V3.1: strong_day/normal_day/weak_day
+        """V3.1.1: strong_day/normal_day/weak_day
         基于大盘环境+候选质量综合判断, 决定本轮最多几个主推
+        strong_day要求极严: 不只是"看起来热闹", 而是"今天真的可以放宽到3单"
         """
-        # bearish / weak_neutral → weak_day
-        if regime in ("bearish",):
+        s = self.settings
+        # bearish → 一定weak
+        if regime == "bearish":
             return "weak"
+        # weak_neutral → 默认weak, 除非有足够高质量候选
         if regime == "weak_neutral":
-            # weak_neutral也可能有好币, 但默认偏保守
             high_q = [c for c in candidates if c.score.total_score >= 65]
             return "normal" if len(high_q) >= 2 else "weak"
 
-        # 判断strong_day: 需要regime非弱 + 多个高质量候选
-        if regime in ("bullish", "neutral"):
-            high_q = [c for c in candidates if c.score.total_score >= 65]
-            # strong_day 条件:
-            # 1. top3都>=65分
-            # 2. 不是纯脉冲造成的虚假热闹
-            # 3. 至少2个有良好结构(1h/4h协调)
-            if len(high_q) >= 3:
-                real_strong = 0
-                for c in high_q[:3]:
-                    p = c.market_data.periods
-                    # 非纯脉冲 + 1h/4h协调
-                    not_pulse = not (p.change_5m > 5 and p.change_15m < 1.5)
-                    coordinated = p.change_1h > 2 and p.change_4h > 1
-                    if not_pulse and coordinated:
-                        real_strong += 1
-                if real_strong >= 2 and regime == "bullish":
-                    return "strong"
+        # strong_day 判定 — 只有bullish才可能
+        if regime == "bullish" and len(candidates) >= 3:
+            # top3按分数排
+            top3 = sorted(candidates, key=lambda c: c.score.total_score, reverse=True)[:3]
+            # 条件1: top3都>=65分
+            if top3[-1].score.total_score < 65:
+                return "normal"
+            real_strong = 0
+            for c in top3:
+                p = c.market_data.periods
+                sk = (c.source.split(":")[0].lower() if ":" in c.source else c.source.lower())
+                # 必须是CEX现货
+                is_cex_top = sk in ("binance", "okx", "bitget")
+                # 非纯脉冲
+                not_pulse = not (p.change_5m > 5 and p.change_15m < 1.5)
+                # 非15m脉冲
+                not_15m_pulse = not (p.change_15m > 6 and p.change_1h < 3)
+                # 1h/4h协调
+                coordinated = p.change_1h > 2 and p.change_4h > 1
+                # 非慢修复
+                not_slow = not (p.change_24h < 0 and p.change_1h < s.slow_repair_min_1h)
+                # 非弱修复
+                not_weak_repair = not (0 < p.change_1h <= s.weak_repair_max_1h
+                                       and p.change_4h < s.weak_repair_max_4h
+                                       and p.volume_ratio_5m < s.weak_repair_min_vr5m
+                                       and p.change_24h < 0)
+                # 非高位反抽
+                pos = getattr(p, 'position_in_24h_range', 0.5)
+                not_high_bounce = not (pos >= 0.65 and p.change_24h > 5 and p.change_4h < 2)
+                # 非尾段
+                not_tail = not (p.change_24h > 10 and p.change_4h < 2)
+
+                if (is_cex_top and not_pulse and not_15m_pulse and coordinated
+                        and not_slow and not_weak_repair and not_high_bounce and not_tail):
+                    real_strong += 1
+
+            # 至少3个都是真正高质量CEX现货
+            if real_strong >= 3:
+                return "strong"
 
         return "normal"
 

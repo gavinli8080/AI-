@@ -109,14 +109,10 @@ class Settings:
     main_max_1h_change: float = 8.5
     main_min_turnover_24h: float = 2_000_000
     main_min_turnover_1h: float = 150_000
-    leverage_watchlist_only: bool = True
     leverage_allowlist: list[str] = field(default_factory=list)
 
-    # V3.1: 杠杆代币全局禁推
-    leverage_token_full_block: bool = True       # 杠杆代币彻底不推送
-    leverage_token_push_disabled: bool = True     # 主推禁杠杆
-    leverage_token_watchlist_disabled: bool = True # 观察池禁杠杆
-    leverage_token_fallback_disabled: bool = True  # fallback禁杠杆
+    # V3.1.1: 杠杆代币全局禁推 (唯一开关, 替代旧的watchlist_only)
+    leverage_token_full_block: bool = True       # true=杠杆代币彻底不推送(主推/观察/fallback全禁)
 
     # V3.1: DEX默认关闭推送
     dex_push_disabled: bool = True       # DEX不进主推
@@ -265,13 +261,9 @@ def load_settings() -> Settings:
     s.main_max_1h_change = _ef("MAIN_MAX_1H_CHANGE",8.5)
     s.main_min_turnover_24h = _ef("MAIN_MIN_TURNOVER_24H",2_000_000)
     s.main_min_turnover_1h = _ef("MAIN_MIN_TURNOVER_1H",150_000)
-    s.leverage_watchlist_only = _eb("LEVERAGE_WATCHLIST_ONLY",True)
     s.leverage_allowlist = [x.upper() for x in _el("LEVERAGE_ALLOWLIST")]
-    # V3.1: 杠杆全局禁推
+    # V3.1.1: 杠杆代币全局禁推 (唯一开关)
     s.leverage_token_full_block = _eb("LEVERAGE_TOKEN_FULL_BLOCK", True)
-    s.leverage_token_push_disabled = _eb("LEVERAGE_TOKEN_PUSH_DISABLED", True)
-    s.leverage_token_watchlist_disabled = _eb("LEVERAGE_TOKEN_WATCHLIST_DISABLED", True)
-    s.leverage_token_fallback_disabled = _eb("LEVERAGE_TOKEN_FALLBACK_DISABLED", True)
     # V3.1: DEX禁推
     s.dex_push_disabled = _eb("DEX_PUSH_DISABLED", True)
     s.dex_watchlist_disabled = _eb("DEX_WATCHLIST_DISABLED", True)
