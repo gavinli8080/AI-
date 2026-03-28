@@ -1,7 +1,7 @@
 """
-Crypto Radar V2 (V3.0)
-24小时短线唯一实盘单筛选器
-V3.0: 4级大盘环境, 唯一一单闸门, 观察池=监控池, 允许空轮
+Crypto Radar V2 (V3.1)
+24小时短线高质量少量候选筛选器
+V3.1: 高质量少量候选(0~2/强势3), 杠杆/DEX全局禁推, strong/normal/weak day
 """
 from __future__ import annotations
 import sys, os, asyncio, logging, time, argparse
@@ -90,6 +90,39 @@ class CryptoRadar:
         if weak_signals >= 2: return "weak_neutral"
         return "neutral"
 
+    def _detect_day_strength(self, regime: str, candidates: list[Signal]) -> str:
+        """V3.1: strong_day/normal_day/weak_day
+        基于大盘环境+候选质量综合判断, 决定本轮最多几个主推
+        """
+        # bearish / weak_neutral → weak_day
+        if regime in ("bearish",):
+            return "weak"
+        if regime == "weak_neutral":
+            # weak_neutral也可能有好币, 但默认偏保守
+            high_q = [c for c in candidates if c.score.total_score >= 65]
+            return "normal" if len(high_q) >= 2 else "weak"
+
+        # 判断strong_day: 需要regime非弱 + 多个高质量候选
+        if regime in ("bullish", "neutral"):
+            high_q = [c for c in candidates if c.score.total_score >= 65]
+            # strong_day 条件:
+            # 1. top3都>=65分
+            # 2. 不是纯脉冲造成的虚假热闹
+            # 3. 至少2个有良好结构(1h/4h协调)
+            if len(high_q) >= 3:
+                real_strong = 0
+                for c in high_q[:3]:
+                    p = c.market_data.periods
+                    # 非纯脉冲 + 1h/4h协调
+                    not_pulse = not (p.change_5m > 5 and p.change_15m < 1.5)
+                    coordinated = p.change_1h > 2 and p.change_4h > 1
+                    if not_pulse and coordinated:
+                        real_strong += 1
+                if real_strong >= 2 and regime == "bullish":
+                    return "strong"
+
+        return "normal"
+
     async def load_caches(self):
         logger.info("Loading market caches...")
         for i, r in enumerate(await asyncio.gather(*(src.load_market_cache() for src in self.sources), return_exceptions=True)):
@@ -112,7 +145,7 @@ class CryptoRadar:
             if isinstance(r, list): all_md.extend(r)
             elif isinstance(r, Exception): logger.error(f"{self.sources[i].name}: {r}")
         logger.info(f"Tickers: {len(all_md)}")
-        # V3.0.1: 大盘环境检测
+        # V3.1: 大盘环境检测
         regime = self._detect_market_regime(all_md)
         self.filter.set_market_regime(regime)
         rs = self.filter.new_round(len(all_md))
@@ -213,31 +246,33 @@ class CryptoRadar:
         # 10. Cross-exchange dedup (V3.0) — 同币多交易所只保留最优
         xd_kept, xd_demoted = self.filter.cross_exchange_dedup(pushed_cands)
 
-        # V2.9.2: Single-best ranking — 多因子排序,不只看分数
+        # V3.1: 高质量少量候选排序 — 多因子,不只看分数
         sb_overflow: list[Signal] = []
-        if s.single_best_mode:
-            def _single_best_key(sig: Signal) -> tuple:
+        if s.high_quality_mode:
+            def _hq_key(sig: Signal) -> tuple:
                 p = sig.market_data.periods
                 sc = sig.score.total_score
                 liq = 1 if p.turnover_24h > 2_000_000 else 0
                 pos = getattr(p, 'position_in_24h_range', 0.5)
-                low_pos = 1 if pos < 0.7 else 0
+                low_pos = 1 if pos < 0.6 else 0
                 not_tail = 1 if not (p.change_24h > 10 and p.change_4h < 2) else 0
                 sk = sig.source.split(":")[0].lower() if ":" in sig.source else sig.source.lower()
                 top_exchange = 1 if sk in ("binance", "okx", "bitget") else 0
                 not_weak = 1 if not (0 < p.change_1h <= 2 and p.change_4h < 1.5 and p.change_24h < 0) else 0
-                return (liq, low_pos, not_tail, top_exchange, not_weak, sc)
+                cex = 1 if sk in ("binance","okx","bitget","gate","bybit") else 0
+                return (cex, liq, low_pos, not_tail, top_exchange, not_weak, sc)
 
-            xd_kept.sort(key=_single_best_key, reverse=True)
-            real_kept: list[Signal] = []
+            xd_kept.sort(key=_hq_key, reverse=True)
+            # 预筛: 分数够高的先保留, 不够的直接溢出
+            pre_kept: list[Signal] = []
             for sig in xd_kept:
-                if len(real_kept) < s.single_best_max_push and sig.score.total_score >= s.single_best_min_score:
-                    real_kept.append(sig)
+                if sig.score.total_score >= s.high_quality_min_score:
+                    pre_kept.append(sig)
                 else:
                     sb_overflow.append(sig)
-            xd_kept = real_kept
+            xd_kept = pre_kept
             if sb_overflow:
-                logger.info(f"SingleBest: kept={len(xd_kept)} overflow={len(sb_overflow)}")
+                logger.info(f"HQ pre-filter: kept={len(xd_kept)} overflow={len(sb_overflow)}")
 
         # 主推溢出 + 跨交易所降级 + single-best溢出 合并到观察池 (已过合法性)
         combined_wl = valid_wl + main_overflow + xd_demoted + sb_overflow
@@ -343,13 +378,15 @@ class CryptoRadar:
             final_wl = wl_clean
 
         # ============================================================
-        # 12c. SINGLE-BEST FINAL GATE (V2.9.2) — 最终信心检验
+        # 12c. HIGH-QUALITY FINAL GATE (V3.1) — 少量高质量候选闸门
         # ============================================================
-        if s.single_best_mode:
+        if s.high_quality_mode:
+            day_strength = self._detect_day_strength(regime, recheck_passed)
             before_gate = len(recheck_passed)
-            recheck_passed = self.filter.single_best_final_gate(recheck_passed)
+            recheck_passed = self.filter.high_quality_final_gate(recheck_passed, day_strength)
+            logger.info(f"HQGate: {before_gate} → {len(recheck_passed)} (day={day_strength} regime={regime})")
             if before_gate > 0 and len(recheck_passed) == 0:
-                logger.info(f"SingleBestGate: {before_gate} candidates → 0 (本轮无主推)")
+                logger.info("HQGate: 本轮无高质量主推, 静默")
 
         # ============================================================
         # 13. PUSH 主推
@@ -415,10 +452,10 @@ class CryptoRadar:
 
     async def run_loop(self):
         s = self.settings
-        logger.info(f"🚀 V3.0 | {s.scoring_mode}")
+        logger.info(f"🚀 V3.1 | {s.scoring_mode}")
         await self.load_caches()
         await self.notifier.push_text(
-            f"🚀 <b>Crypto Radar V3.0</b>\n"
+            f"🚀 <b>Crypto Radar V3.1</b>\n"
             f"模式:{s.scoring_mode} 间隔:{s.scan_interval_seconds}s\n"
             f"源:{','.join(src.name for src in self.sources)}\n"
             f"价格校验:{'开' if s.enable_price_verification else '关'} "

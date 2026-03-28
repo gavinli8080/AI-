@@ -214,12 +214,14 @@ class TestMarketRegimeFilter(unittest.TestCase):
         self.assertTrue(ok)
 
 
-class TestSingleBestFinalGate(unittest.TestCase):
+class TestHighQualityFinalGate(unittest.TestCase):
     def setUp(self):
-        self.settings = Settings(scoring_mode="strict", single_best_mode=True,
-                                 single_best_min_score=60.0,
-                                 single_best_min_edge=6.0,
-                                 single_best_require_clear_win=True)
+        self.settings = Settings(scoring_mode="strict", high_quality_mode=True,
+                                 default_max_main_push=2,
+                                 strong_day_max_main_push=3,
+                                 high_quality_min_score=60.0,
+                                 high_quality_min_edge=5.0,
+                                 require_clear_candidate=True)
         self.f = SignalFilter(self.settings)
         self.f.new_round(100)
 
@@ -228,7 +230,7 @@ class TestSingleBestFinalGate(unittest.TestCase):
         sig = _sig(score=55, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                    change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                    turnover_1h=200_000, volume_ratio_5m=2.5)
-        result = self.f.single_best_final_gate([sig])
+        result = self.f.high_quality_final_gate([sig])
         self.assertEqual(len(result), 0)
 
     def test_strong_top1_passes(self):
@@ -236,31 +238,61 @@ class TestSingleBestFinalGate(unittest.TestCase):
         sig = _sig(score=68, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                    change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                    turnover_1h=200_000, volume_ratio_5m=2.5)
-        result = self.f.single_best_final_gate([sig])
+        result = self.f.high_quality_final_gate([sig])
         self.assertEqual(len(result), 1)
 
-    def test_close_scores_rejected(self):
-        """top1和top2差距<6且top1<72 → 不够确定"""
+    def test_normal_day_max_2(self):
+        """normal day最多2个主推"""
+        sig1 = _sig("A/USDT", score=75, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        sig2 = _sig("B/USDT", score=68, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        sig3 = _sig("C/USDT", score=62, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        result = self.f.high_quality_final_gate([sig1, sig2, sig3], "normal")
+        self.assertLessEqual(len(result), 2)
+
+    def test_strong_day_allows_3(self):
+        """strong day最多3个主推(都够强时)"""
+        sig1 = _sig("A/USDT", score=78, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        sig2 = _sig("B/USDT", score=73, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        sig3 = _sig("C/USDT", score=68, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        result = self.f.high_quality_final_gate([sig1, sig2, sig3], "strong")
+        self.assertLessEqual(len(result), 3)
+        self.assertGreaterEqual(len(result), 2)  # 至少2个够强
+
+    def test_close_scores_rejected_as_padding(self):
+        """top2和top1差距<5且top2<72 → 凑数不推"""
         sig1 = _sig("A/USDT", score=65, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                     change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                     turnover_1h=200_000, volume_ratio_5m=2.5)
         sig2 = _sig("B/USDT", score=62, change_5m=2.0, change_1h=4.0, change_4h=5.0,
                     change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
                     turnover_1h=200_000, volume_ratio_5m=2.5)
-        result = self.f.single_best_final_gate([sig1, sig2])
-        self.assertEqual(len(result), 0)
-
-    def test_clear_winner_passes(self):
-        """top1明显领先(gap>=6) → 通过"""
-        sig1 = _sig("A/USDT", score=75, change_5m=2.0, change_1h=4.0, change_4h=5.0,
-                    change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
-                    turnover_1h=200_000, volume_ratio_5m=2.5)
-        sig2 = _sig("B/USDT", score=55, change_5m=2.0, change_1h=4.0, change_4h=5.0,
-                    change_15m=3.0, change_24h=8.0, turnover_24h=2_000_000,
-                    turnover_1h=200_000, volume_ratio_5m=2.5)
-        result = self.f.single_best_final_gate([sig1, sig2])
+        result = self.f.high_quality_final_gate([sig1, sig2])
+        # top1通过, top2因为gap<5且<72被拒
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].symbol, "A/USDT")
+
+    def test_weak_day_max_1(self):
+        """weak day最多1个主推"""
+        sig1 = _sig("A/USDT", score=75, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        sig2 = _sig("B/USDT", score=70, change_5m=2.0, change_1h=4.0, change_4h=5.0,
+                    change_15m=3.0, change_24h=8.0, turnover_24h=3_000_000,
+                    turnover_1h=200_000, volume_ratio_5m=2.5)
+        result = self.f.high_quality_final_gate([sig1, sig2], "weak")
+        self.assertLessEqual(len(result), 1)
 
 
 class TestWatchlistTightened(unittest.TestCase):

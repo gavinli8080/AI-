@@ -356,8 +356,23 @@ class SignalFilter:
             self._stats.post_rej["放弃"]+=1; return False,"放弃"
 
         p = signal.market_data.periods
-        if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist and s.leverage_watchlist_only:
-            self._stats.post_rej["杠杆"] += 1; return False, "杠杆代币主推禁用"
+        sk = _src_key(signal.source)
+        is_dex = sk in ("dex", "dexscreener")
+
+        # V3.1: 杠杆代币全局禁推
+        if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist:
+            if s.leverage_token_full_block or s.leverage_token_push_disabled:
+                self._stats.post_rej["杠杆禁推"] += 1; return False, "杠杆代币全局禁推"
+            if s.leverage_watchlist_only:
+                self._stats.post_rej["杠杆"] += 1; return False, "杠杆代币主推禁用"
+
+        # V3.1: DEX禁推
+        if is_dex and s.dex_push_disabled:
+            self._stats.post_rej["DEX禁推"] += 1; return False, "DEX代币不进主推"
+
+        # V3.1: 主推仅CEX现货
+        if getattr(s, 'require_cex_only_for_main', True) and not is_dex and sk not in CEX_SOURCE_NAMES:
+            self._stats.post_rej["非CEX"] += 1; return False, f"非CEX源({sk})不进主推"
         if s.main_require_positive_1h and p.change_1h <= 0:
             self._stats.post_rej["1h弱"] += 1; return False, "1h不为正"
         if s.main_require_positive_4h and p.change_4h <= 0:
@@ -415,7 +430,6 @@ class SignalFilter:
             return False, f"高位反抽(pos={pos:.0%} 24h={p.change_24h:.1f}% 4h={p.change_4h:.1f}%)"
 
         # V3.0: 大盘环境 — 4级门控
-        sk = _src_key(signal.source)
         regime = self._market_regime
         if s.market_regime_enabled:
             if regime == "bearish":
@@ -452,12 +466,20 @@ class SignalFilter:
         if signal.phase == SignalPhase.REJECT: return False
         if signal.score.total_score < wl_min: return False
         p = signal.market_data.periods
+        sk = _src_key(signal.source)
+        is_dex = sk in ("dex", "dexscreener")
+
+        # V3.1: 杠杆代币全局禁止进观察池
+        if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist:
+            if s.leverage_token_full_block or s.leverage_token_watchlist_disabled:
+                return False
+        # V3.1: DEX禁止进观察池
+        if is_dex and s.dex_watchlist_disabled: return False
+        # V3.1: 观察池仅CEX
+        if getattr(s, 'watchlist_require_cex_only', True) and is_dex: return False
 
         # 1h必须为正
         if s.watchlist_require_positive_1h and p.change_1h <= 0: return False
-        # 杠杆代币更严
-        if _is_leverage_symbol(signal.symbol) and _base_symbol(signal.symbol) not in s.leverage_allowlist:
-            if p.change_1h <= 0 or p.change_4h <= 0: return False
         # 24h过热
         if p.change_24h > s.watchlist_reject_if_24h_overheat: return False
 
@@ -490,16 +512,22 @@ class SignalFilter:
         # 量比不一致(5m高15m不跟)不收
         if p.volume_ratio_5m > 5 and p.volume_ratio_15m < 1.3: return False
 
+        # V3.1: 弱市小所不进观察池
+        if getattr(s, 'watchlist_reject_small_exchange', True):
+            regime = self._market_regime
+            if regime in ("bearish", "weak_neutral") and sk in ("gate", "bybit"):
+                return False
+
         # 大盘环境
         regime = self._market_regime
         if s.market_regime_enabled:
             if regime == "bearish":
                 if signal.score.total_score < s.market_regime_bearish_wl_min_score: return False
                 if s.bearish_strict_watchlist:
-                    sk = _src_key(signal.source)
                     if sk in ("gate", "bybit", "dex", "dexscreener"): return False
             elif regime == "weak_neutral" and s.weak_neutral_strict_watchlist:
                 if signal.score.total_score < 45: return False
+                if sk in ("gate", "bybit") and p.turnover_24h < 3_000_000: return False
 
         ok, _ = self.check_watchlist_cooldown(signal)
         if not ok: return False
@@ -535,8 +563,15 @@ class SignalFilter:
         result = []
         for sig in signals:
             p = sig.market_data.periods
+            sk = _src_key(sig.source)
+            is_dex = sk in ("dex", "dexscreener")
             if sig.phase == SignalPhase.REJECT: continue
             if sig.score.total_score < s.fallback_min_score: continue
+            # V3.1: 杠杆/DEX/非CEX全部禁止进fallback
+            if _is_leverage_symbol(sig.symbol) and _base_symbol(sig.symbol) not in s.leverage_allowlist:
+                if s.leverage_token_full_block or s.leverage_token_fallback_disabled: continue
+            if is_dex and s.dex_fallback_disabled: continue
+            if getattr(s, 'fallback_require_cex_only', True) and sk not in CEX_SOURCE_NAMES: continue
             if p.turnover_24h > 0 and p.turnover_24h < s.fallback_min_turnover_24h: continue
             if p.turnover_1h > 0 and p.turnover_1h < s.fallback_min_turnover_1h: continue
             if p.change_1h <= 0: continue
@@ -550,6 +585,8 @@ class SignalFilter:
                 if p.change_1h < s.slow_repair_min_1h or p.change_4h < s.slow_repair_min_4h: continue
             if (0 < p.change_1h <= s.weak_repair_max_1h and p.change_4h < s.weak_repair_max_4h
                 and p.volume_ratio_5m < s.weak_repair_min_vr5m and p.change_24h < 0): continue
+            # 无量修复
+            if p.change_24h < 0 and p.volume_ratio_5m < 1.3 and p.volume_ratio_15m < 1.2: continue
             # 纯脉冲
             if p.change_5m > s.pulse_5m_change_threshold and p.change_1h < s.pulse_5m_1h_max: continue
             if p.change_15m > 6 and p.change_1h < 3 and p.change_4h < 2: continue
@@ -558,76 +595,110 @@ class SignalFilter:
             # 量比异常
             if p.volume_ratio_5m >= s.volume_ratio_heavy_threshold and p.change_15m < 1.5: continue
             if p.volume_ratio_5m > 5 and p.volume_ratio_15m < 1.3: continue
+            # 高位反抽
+            pos = getattr(p, 'position_in_24h_range', 0.5)
+            if pos >= 0.65 and p.change_24h > 5 and p.change_4h < 2: continue
             # 小所小币
             if s.fallback_reject_small_exchange:
-                sk = _src_key(sig.source)
                 if sk in ("gate", "bybit", "dex", "dexscreener") and p.turnover_24h < 3_000_000: continue
             result.append(sig)
         return result
 
-    # =================== 唯一一单最终闸门 (V3.0) ===================
-    def single_best_final_gate(self, signals: list[Signal]) -> list[Signal]:
-        """V3.0: 今天有没有值得打的一枪? 不是今天排第一的是谁。
-        - top1 低于 min_score → 不推
-        - top1 是慢修复/尾段/小所噪音 → 不推
-        - top1 和 top2 差距 < min_edge 且 top1 < 72 → 不够确定
-        - require_clear_win: top1 必须有结构优势
+    # =================== 高质量少量候选最终闸门 (V3.1) ===================
+    def high_quality_final_gate(self, signals: list[Signal], day_strength: str = "normal") -> list[Signal]:
+        """V3.1: 高质量少量候选筛选器
+        - 正常最多2个, 强势日最多3个, 弱市最多0~1个
+        - 每个候选必须是clear candidate, 凑数的不推
         - 允许返回空列表
         """
         s = self.settings
-        if not s.single_best_mode or not signals:
+        if not s.high_quality_mode or not signals:
             return signals
+
+        # 根据 day_strength 决定本轮最大推送数
+        if day_strength == "strong":
+            max_push = s.strong_day_max_main_push
+        elif day_strength == "weak":
+            max_push = 1
+        else:
+            max_push = s.default_max_main_push
+
+        # 大盘bearish进一步收紧
+        regime = self._market_regime
+        if regime == "bearish":
+            max_push = min(max_push, 1)
+        elif regime == "weak_neutral":
+            max_push = min(max_push, 2)
 
         # 多因子排序: 不只看分数
         def _final_key(sig: Signal) -> tuple:
             p = sig.market_data.periods
-            sk = _src_key(sig.source)
+            sk_local = _src_key(sig.source)
             suitable = 1 if sig.advice.is_suitable_for_24h_trade else 0
             pos = getattr(p, 'position_in_24h_range', 0.5)
             low_pos = 1 if pos < 0.55 else 0
+            cex = 1 if sk_local in CEX_SOURCE_NAMES else 0
+            not_lev = 0 if _is_leverage_symbol(sig.symbol) else 1
+            not_dex = 0 if sk_local in ("dex", "dexscreener") else 1
             coordinated = 1 if (2 < p.change_1h < 15 and 1 < p.change_4h < 20) else 0
             not_tail = 1 if not (p.change_24h > 10 and p.change_4h < 2) else 0
             not_slow = 1 if not (p.change_24h < 0 and p.change_1h < 3) else 0
             not_pulse = 1 if not (p.change_5m > 5 and p.change_15m < 1.5) else 0
             liq = 1 if p.turnover_24h > 2_000_000 else 0
-            top_ex = 1 if sk in ("binance", "okx", "bitget") else 0
-            return (suitable, low_pos, coordinated, not_tail, not_slow, not_pulse, liq, top_ex, sig.score.total_score)
+            top_ex = 1 if sk_local in ("binance", "okx", "bitget") else 0
+            return (suitable, cex, not_lev, not_dex, low_pos, coordinated, not_tail, not_slow, not_pulse, liq, top_ex, sig.score.total_score)
 
         signals.sort(key=_final_key, reverse=True)
-        top1 = signals[0]
-        p1 = top1.market_data.periods
 
-        # 分数不够 → 本轮无
-        if top1.score.total_score < s.single_best_min_score:
-            logger.info(f"SingleBestGate: top1 {top1.symbol} score={top1.score.total_score:.0f} "
-                        f"< {s.single_best_min_score:.0f}, 放弃")
-            return []
+        # 逐个检查, 只保留真正的clear candidate
+        result: list[Signal] = []
+        for i, sig in enumerate(signals):
+            if len(result) >= max_push:
+                break
 
-        # require_clear_win: top1必须有真正的结构优势
-        if s.single_best_require_clear_win:
-            # 慢修复不配当唯一一单
-            if p1.change_24h < 0 and p1.change_1h < s.slow_repair_min_1h:
-                logger.info(f"SingleBestGate: top1 {top1.symbol} 慢修复不推")
-                return []
-            # 尾段不配当唯一一单
-            if p1.change_24h > s.tail_surge_24h_min and p1.change_4h < 2:
-                logger.info(f"SingleBestGate: top1 {top1.symbol} 尾段不推")
-                return []
-            # 纯脉冲不配
-            if p1.change_5m > 5 and p1.change_15m < 1.5:
-                logger.info(f"SingleBestGate: top1 {top1.symbol} 纯脉冲不推")
-                return []
+            p = sig.market_data.periods
+            sc = sig.score.total_score
 
-        # 有多个候选且差距不明显 → 不够确定
-        if len(signals) >= 2:
-            top2 = signals[1]
-            gap = top1.score.total_score - top2.score.total_score
-            if gap < s.single_best_min_edge and top1.score.total_score < 72:
-                logger.info(f"SingleBestGate: gap={gap:.0f} < {s.single_best_min_edge:.0f}, "
-                            f"top1={top1.score.total_score:.0f} top2={top2.score.total_score:.0f}, 不够确定")
-                return []
+            # 分数不够 → 后面的更不行
+            if sc < s.high_quality_min_score:
+                logger.info(f"HQGate: #{i+1} {sig.symbol} score={sc:.0f} < {s.high_quality_min_score:.0f}, 放弃后续")
+                break
 
-        return [top1]
+            # require_clear_candidate: 结构有硬伤不推
+            if s.require_clear_candidate:
+                # 慢修复不配
+                if p.change_24h < 0 and p.change_1h < s.slow_repair_min_1h:
+                    logger.info(f"HQGate: #{i+1} {sig.symbol} 慢修复跳过")
+                    continue
+                # 尾段不配
+                if p.change_24h > s.tail_surge_24h_min and p.change_4h < 2:
+                    logger.info(f"HQGate: #{i+1} {sig.symbol} 尾段跳过")
+                    continue
+                # 纯脉冲不配
+                if p.change_5m > 5 and p.change_15m < 1.5:
+                    logger.info(f"HQGate: #{i+1} {sig.symbol} 纯脉冲跳过")
+                    continue
+
+            # 与已选候选有差距 → 是否凑数?
+            if result and s.high_quality_min_edge > 0:
+                gap = result[-1].score.total_score - sc
+                if gap >= s.high_quality_min_edge:
+                    pass  # 差距明显, 这个本身够强就收
+                elif sc < 72:
+                    # 差距不大且不够强 → 凑数不推
+                    logger.info(f"HQGate: #{i+1} {sig.symbol} gap={gap:.0f} too close & score={sc:.0f}<72, 凑数不推")
+                    continue
+
+            result.append(sig)
+
+        if len(result) < len(signals):
+            logger.info(f"HQGate: {len(signals)} candidates → {len(result)} (day={day_strength} max={max_push})")
+
+        return result
+
+    # 向后兼容: 旧名指向新gate
+    def single_best_final_gate(self, signals: list[Signal]) -> list[Signal]:
+        return self.high_quality_final_gate(signals, "normal")
 
     # =================== 跨交易所去重 (V2.9) ===================
     def cross_exchange_dedup(self, signals: list[Signal]) -> tuple[list[Signal], list[Signal]]:
